@@ -58259,6 +58259,17 @@ uintptr_t js_std_cmd(int cmd, ...) {
     return rv;
 }
 
+#define ISDEF(name, id) \
+bool JS_Is ##name(JSValue val){ \
+	return JS_GetClassID(val) == id; \
+}
+
+ISDEF(Set, JS_CLASS_SET);
+ISDEF(WeakSet, JS_CLASS_WEAKSET);
+ISDEF(WeakMap, JS_CLASS_WEAKMAP);
+ISDEF(WeakRef, JS_CLASS_WEAK_REF);
+#undef ISDEF
+
 #undef malloc
 #undef free
 #undef realloc

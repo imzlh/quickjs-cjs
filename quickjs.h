@@ -847,6 +847,13 @@ JS_EXTERN bool JS_IsWeakSet(JSValueConst val);
 JS_EXTERN bool JS_IsWeakMap(JSValueConst val);
 JS_EXTERN bool JS_IsDataView(JSValueConst val);
 
+#define ISDEF(name, id) JS_EXTERN bool JS_Is ##name(JSValue val);
+ISDEF(Set, JS_CLASS_SET);
+ISDEF(WeakSet, JS_CLASS_WEAKSET);
+ISDEF(WeakMap, JS_CLASS_WEAKMAP);
+ISDEF(WeakRef, JS_CLASS_WEAK_REF);
+#undef ISDEF
+
 JS_EXTERN JSValue JS_NewArray(JSContext *ctx);
 // takes ownership of the values
 JS_EXTERN JSValue JS_NewArrayFrom(JSContext *ctx, int count,
