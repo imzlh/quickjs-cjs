@@ -291,6 +291,9 @@ struct JSRuntime {
 
     struct JSStackFrame *current_stack_frame;
 
+	JSBuildBacktraceHook* backtrace_hook;
+	void* backtrace_hook_opaque;
+
     JSInterruptHandler *interrupt_handler;
     void *interrupt_opaque;
 
@@ -6930,6 +6933,8 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
             goto done;
         if (filename) {
             i++;
+			if (rt->backtrace_hook)
+				rt->backtrace_hook(ctx, filename, &line_num, &col_num);
             dbuf_printf(&dbuf, "    at %s", filename);
             if (line_num != -1)
                 dbuf_printf(&dbuf, ":%d:%d", line_num, col_num);
@@ -6990,8 +6995,11 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
                 atom_str = b->filename ? JS_AtomToCString(ctx, b->filename) : NULL;
                 dbuf_printf(&dbuf, " (%s", atom_str ? atom_str : "<null>");
                 JS_FreeCString(ctx, atom_str);
-                if (line_num1 != -1)
+                if (line_num1 != -1){
+					if (rt->backtrace_hook)
+						rt->backtrace_hook(ctx, atom_str, &line_num1, &col_num1);
                     dbuf_printf(&dbuf, ":%d:%d", line_num1, col_num1);
+				}
                 dbuf_putc(&dbuf, ')');
             } else if (b) {
                 // FIXME(bnoordhuis) Missing `sf->cur_pc = pc` in bytecode
@@ -7062,6 +7070,11 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     }
 
     rt->in_build_stack_trace = false;
+}
+
+void JS_SetBacktraceHook(JSRuntime* rt, JSBuildBacktraceHook* hook, void* opaque){
+	rt->backtrace_hook = hook;
+	rt->backtrace_hook_opaque = opaque;
 }
 
 JSValue JS_NewError(JSContext *ctx)
@@ -58258,17 +58271,6 @@ uintptr_t js_std_cmd(int cmd, ...) {
 
     return rv;
 }
-
-#define ISDEF(name, id) \
-bool JS_Is ##name(JSValue val){ \
-	return JS_GetClassID(val) == id; \
-}
-
-ISDEF(Set, JS_CLASS_SET);
-ISDEF(WeakSet, JS_CLASS_WEAKSET);
-ISDEF(WeakMap, JS_CLASS_WEAKMAP);
-ISDEF(WeakRef, JS_CLASS_WEAK_REF);
-#undef ISDEF
 
 #undef malloc
 #undef free

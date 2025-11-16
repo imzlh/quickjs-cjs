@@ -1059,6 +1059,9 @@ JS_EXTERN void JS_SetCanBlock(JSRuntime *rt, bool can_block);
 /* set the [IsHTMLDDA] internal slot */
 JS_EXTERN void JS_SetIsHTMLDDA(JSContext *ctx, JSValueConst obj);
 
+typedef void JSBuildBacktraceHook(JSContext* ctx, const char* name, int* line, int* col);
+JS_EXTERN void JS_SetBacktraceHook(JSRuntime* rt, JSBuildBacktraceHook* hook, void* opaque);
+
 typedef struct JSModuleDef JSModuleDef;
 
 /* return the module specifier (allocated with js_malloc()) or NULL if
