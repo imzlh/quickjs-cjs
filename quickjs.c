@@ -36099,9 +36099,14 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
         goto fail;
 
     if (s->allow_debug) {
+        int line = b->line_num, col = b->col_num;
+		if (s->ctx->rt->backtrace_hook) {
+			const char* filename = JS_AtomToCString(s->ctx, b->filename);
+			s->ctx->rt->backtrace_hook(s->ctx, filename, &line, &col);
+		}
         bc_put_atom(s, b->filename);
-        bc_put_leb128(s, b->line_num);
-        bc_put_leb128(s, b->col_num);
+        bc_put_leb128(s, line);
+        bc_put_leb128(s, col);
         bc_put_leb128(s, b->pc2line_len);
         dbuf_put(&s->dbuf, b->pc2line_buf, b->pc2line_len);
         if (s->allow_source && b->source) {
