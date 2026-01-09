@@ -50,13 +50,17 @@ extern "C" {
 #elif defined(_WIN32)
 #include <windows.h>
 #endif
-#if !defined(_WIN32) && !defined(EMSCRIPTEN) && !defined(__wasi__)
+#if !defined(_WIN32) && !defined(EMSCRIPTEN) && !defined(__wasi__) && !defined(__DJGPP)
 #include <errno.h>
 #include <pthread.h>
 #endif
 #if !defined(_WIN32)
 #include <limits.h>
 #include <unistd.h>
+#endif
+
+#if defined(__sun)
+#undef __maybe_unused
 #endif
 
 #if defined(_MSC_VER) && !defined(__clang__)
@@ -73,15 +77,6 @@ extern "C" {
 #  define force_inline inline __attribute__((always_inline))
 #  define no_inline __attribute__((noinline))
 #  define __maybe_unused __attribute__((unused))
-#endif
-
-#if defined(_MSC_VER) && !defined(__clang__)
-#include <math.h>
-#define INF INFINITY
-#define NEG_INF -INFINITY
-#else
-#define INF (1.0/0.0)
-#define NEG_INF (-1.0/0.0)
 #endif
 
 #ifndef offsetof
@@ -587,7 +582,7 @@ int js_exepath(char* buffer, size_t* size);
 
 /* Cross-platform threading APIs. */
 
-#if defined(EMSCRIPTEN) || defined(__wasi__)
+#if defined(EMSCRIPTEN) || defined(__wasi__) || defined(__DJGPP)
 
 #define JS_HAVE_THREADS 0
 
@@ -633,6 +628,25 @@ int js_thread_create(js_thread_t *thrd, void (*start)(void *), void *arg,
 int js_thread_join(js_thread_t thrd);
 
 #endif /* !defined(EMSCRIPTEN) && !defined(__wasi__) */
+
+// JS requires strict rounding behavior. Turn on 64-bits double precision
+// and disable x87 80-bits extended precision for intermediate floating-point
+// results. 0x300 is extended  precision, 0x200 is double precision.
+// Note that `*&cw` in the asm constraints looks redundant but isn't.
+#if defined(__i386__) && !defined(_MSC_VER)
+#define JS_X87_FPCW_SAVE_AND_ADJUST(cw)                                     \
+    unsigned short cw;                                                      \
+    __asm__ __volatile__("fnstcw %0" : "=m"(*&cw));                         \
+    do {                                                                    \
+        unsigned short t = 0x200 | (cw & ~0x300);                           \
+        __asm__ __volatile__("fldcw %0" : /*empty*/ : "m"(*&t));            \
+    } while (0)
+#define JS_X87_FPCW_RESTORE(cw)                                             \
+    __asm__ __volatile__("fldcw %0" : /*empty*/ : "m"(*&cw))
+#else
+#define JS_X87_FPCW_SAVE_AND_ADJUST(cw)
+#define JS_X87_FPCW_RESTORE(cw)
+#endif
 
 #ifdef __cplusplus
 } /* extern "C" { */
