@@ -28068,6 +28068,25 @@ JSModuleDef *JS_NewCModule(JSContext *ctx, const char *name_str,
     return m;
 }
 
+/* `name_str` may be pure ASCII or UTF-8 encoded */
+JSModuleDef *JS_NewCModule2(JSContext *ctx, const char *name_str)
+{
+    JSModuleDef *m;
+    JSAtom name;
+    name = JS_NewAtom(ctx, name_str);
+    if (name == JS_ATOM_NULL)
+        return NULL;
+    m = js_new_module_def(ctx, name);
+    if (!m)
+        return NULL;
+    m->init_func = (void*)0xffff;			// non-NULL = CModule
+	m->status = JS_MODULE_STATUS_EVALUATED;	// skip init_func executing
+	m->cycle_root = m;
+	m->module_ns = JS_NewObjectProto(ctx, JS_NULL);
+
+	return m;
+}
+
 /* `export_name` may be pure ASCII or UTF-8 encoded */
 int JS_AddModuleExport(JSContext *ctx, JSModuleDef *m, const char *export_name)
 {
@@ -28929,6 +28948,15 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
     /* check the indirect exports */
     for(i = 0; i < m->export_entries_count; i++) {
         JSExportEntry *me = &m->export_entries[i];
+		#ifdef ENABLE_DUMPS // JS_DUMP_MODULE_RESOLVE
+		if (check_dump_flag(ctx->rt, JS_DUMP_MODULE_RESOLVE)) {
+			char buf1[128], buf2[128];
+			printf("Export: local_name=%s, export_name=%s\n",
+				JS_AtomGetStr(ctx, buf1, sizeof(buf1), m->export_entries[i].local_name),
+				JS_AtomGetStr(ctx, buf2, sizeof(buf2), m->export_entries[i].export_name)
+			);
+		}
+#endif
         if (me->export_type == JS_EXPORT_TYPE_INDIRECT &&
             me->local_name != JS_ATOM__star_) {
             JSResolveResultEnum ret;
@@ -29097,6 +29125,28 @@ static int js_link_module(JSContext *ctx, JSModuleDef *m)
            m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
            m->status == JS_MODULE_STATUS_EVALUATED);
     return 0;
+}
+
+void* JS_DefineModuleExport(JSContext *ctx, JSModuleDef *m, JSAtom name, JSValue val)
+{
+    JSExportEntry *me;
+	
+	// find repeated element
+	me = find_export_entry(ctx, m, name);
+	if(!me) me = add_export_entry2(ctx, NULL, m, name, name, JS_EXPORT_TYPE_LOCAL);
+
+	// create
+	me->u.local.var_ref = js_create_module_var(ctx, false);
+    set_value(ctx, me->u.local.var_ref->pvalue, val);
+
+	// also link to nd
+	JS_DefinePropertyValue(ctx, m->module_ns, name, js_dup(val), JS_PROP_C_W_E);
+
+    return me->u.local.var_ref;
+}
+
+void JS_FreeModuleExport(JSRuntime* rt, void* module_var) {
+	free_var_ref(rt, module_var);
 }
 
 /* return JS_ATOM_NULL if the name cannot be found. Only works with

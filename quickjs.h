@@ -1313,10 +1313,13 @@ typedef int JSModuleInitFunc(JSContext *ctx, JSModuleDef *m);
 
 JS_EXTERN JSModuleDef *JS_NewCModule(JSContext *ctx, const char *name_str,
                                      JSModuleInitFunc *func);
+JS_EXTERN JSModuleDef *JS_NewCModule2(JSContext *ctx, const char *name_str);
 /* can only be called before the module is instantiated */
 JS_EXTERN int JS_AddModuleExport(JSContext *ctx, JSModuleDef *m, const char *name_str);
 JS_EXTERN int JS_AddModuleExportList(JSContext *ctx, JSModuleDef *m,
                                       const JSCFunctionListEntry *tab, int len);
+JS_EXTERN void* JS_DefineModuleExport(JSContext *ctx, JSModuleDef *m, JSAtom name, JSValue val);
+JS_EXTERN void JS_FreeModuleExport(JSRuntime* rt, void* module_var);
 /* can only be called after the module is instantiated */
 JS_EXTERN int JS_SetModuleExport(JSContext *ctx, JSModuleDef *m, const char *export_name,
                                  JSValue val);
