@@ -30132,7 +30132,8 @@ void* JS_DefineModuleExport(JSContext *ctx, JSModuleDef *m, JSAtom name, JSValue
 	if(!me) me = add_export_entry2(ctx, NULL, m, name, name, JS_EXPORT_TYPE_LOCAL);
 
 	// create
-	me->u.local.var_ref = js_create_module_var(ctx, false);
+	if(!me->u.local.var_ref)
+		me->u.local.var_ref = js_create_module_var(ctx, false);
     set_value(ctx, me->u.local.var_ref->pvalue, val);
 
 	// also link to nd
