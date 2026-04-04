@@ -29854,7 +29854,7 @@ static int js_create_module_function(JSContext *ctx, JSModuleDef *m)
         /* initialize the exported variables */
         for(i = 0; i < m->export_entries_count; i++) {
             JSExportEntry *me = &m->export_entries[i];
-            if (me->export_type == JS_EXPORT_TYPE_LOCAL) {
+            if (me->export_type == JS_EXPORT_TYPE_LOCAL && !me->u.local.var_ref) {
                 var_ref = js_create_module_var(ctx, false);
                 if (!var_ref)
                     return -1;
