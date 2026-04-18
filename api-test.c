@@ -905,6 +905,119 @@ static void immutable_array_buffer(void)
     JS_FreeRuntime(rt);
 }
 
+static void get_uint8array(void)
+{
+    JSRuntime *rt = JS_NewRuntime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue val;
+    uint8_t *p;
+    size_t size;
+    uint8_t buf[3] = { 1, 2, 3 };
+
+    val = eval(ctx, "new Uint8Array(0)");
+    assert(!JS_IsException(val));
+    p = JS_GetUint8Array(ctx, &size, val);
+    assert(p != NULL);
+    assert(size == 0);
+    JS_FreeValue(ctx, val);
+
+    val = JS_NewUint8Array(ctx, NULL, 0, NULL, NULL, false);
+    assert(!JS_IsException(val));
+    p = JS_GetUint8Array(ctx, &size, val);
+    assert(p != NULL);
+    assert(size == 0);
+    JS_FreeValue(ctx, val);
+
+    val = JS_NewUint8ArrayCopy(ctx, NULL, 0);
+    assert(!JS_IsException(val));
+    p = JS_GetUint8Array(ctx, &size, val);
+    assert(p != NULL);
+    assert(size == 0);
+    JS_FreeValue(ctx, val);
+
+    val = JS_NewUint8ArrayCopy(ctx, buf, sizeof(buf));
+    assert(!JS_IsException(val));
+    p = JS_GetUint8Array(ctx, &size, val);
+    assert(p != NULL);
+    assert(size == 3);
+    assert(p[0] == 1 && p[1] == 2 && p[2] == 3);
+    JS_FreeValue(ctx, val);
+
+    val = eval(ctx, "new Uint8Array([4, 5, 6])");
+    assert(!JS_IsException(val));
+    p = JS_GetUint8Array(ctx, &size, val);
+    assert(p != NULL);
+    assert(size == 3);
+    assert(p[0] == 4 && p[1] == 5 && p[2] == 6);
+    JS_FreeValue(ctx, val);
+
+    val = eval(ctx, "new Int32Array(4)");
+    assert(!JS_IsException(val));
+    p = JS_GetUint8Array(ctx, &size, val);
+    assert(p == NULL);
+    assert(size == 0);
+    JS_FreeValue(ctx, val);
+
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+static void new_symbol(void)
+{
+    JSRuntime *rt = JS_NewRuntime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue global = JS_GetGlobalObject(ctx);
+    JSValue sym, ret;
+
+    /* Local symbol with NULL description -> Symbol() */
+    sym = JS_NewSymbol(ctx, NULL, false);
+    assert(!JS_IsException(sym));
+    assert(JS_IsSymbol(sym));
+    JS_SetPropertyStr(ctx, global, "sym_local_null", sym);
+
+    ret = eval(ctx, "typeof sym_local_null === 'symbol' && sym_local_null.description === undefined && Symbol.keyFor(sym_local_null) === undefined");
+    assert(JS_IsBool(ret));
+    assert(JS_VALUE_GET_BOOL(ret));
+    JS_FreeValue(ctx, ret);
+
+    /* Global symbol with NULL description -> Symbol.for() -> Symbol.for('undefined') */
+    sym = JS_NewSymbol(ctx, NULL, true);
+    assert(!JS_IsException(sym));
+    assert(JS_IsSymbol(sym));
+    JS_SetPropertyStr(ctx, global, "sym_global_null", sym);
+
+    ret = eval(ctx, "typeof sym_global_null === 'symbol' && sym_global_null.description === 'undefined' && Symbol.keyFor(sym_global_null) === 'undefined'");
+    assert(JS_IsBool(ret));
+    assert(JS_VALUE_GET_BOOL(ret));
+    JS_FreeValue(ctx, ret);
+
+    /* Local symbol with description -> Symbol('test_local') */
+    sym = JS_NewSymbol(ctx, "test_local", false);
+    assert(!JS_IsException(sym));
+    assert(JS_IsSymbol(sym));
+    JS_SetPropertyStr(ctx, global, "sym_local_str", sym);
+
+    ret = eval(ctx, "sym_local_str.description === 'test_local' && Symbol.keyFor(sym_local_str) === undefined");
+    assert(JS_IsBool(ret));
+    assert(JS_VALUE_GET_BOOL(ret));
+    JS_FreeValue(ctx, ret);
+
+    /* Global symbol with description -> Symbol.for('test_global') */
+    sym = JS_NewSymbol(ctx, "test_global", true);
+    assert(!JS_IsException(sym));
+    assert(JS_IsSymbol(sym));
+    JS_SetPropertyStr(ctx, global, "sym_global_str", sym);
+
+    ret = eval(ctx, "sym_global_str.description === 'test_global' && Symbol.keyFor(sym_global_str) === 'test_global'");
+    assert(JS_IsBool(ret));
+    assert(JS_VALUE_GET_BOOL(ret));
+    JS_FreeValue(ctx, ret);
+
+    JS_FreeValue(ctx, global);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 int main(void)
 {
     cfunctions();
@@ -923,5 +1036,7 @@ int main(void)
     global_object_prototype();
     slice_string_tocstring();
     immutable_array_buffer();
+    get_uint8array();
+    new_symbol();
     return 0;
 }
