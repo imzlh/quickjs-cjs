@@ -85,6 +85,18 @@
 #define ENABLE_DUMPS
 #endif
 
+#ifdef _MSC_VER
+#undef assert
+static inline void assert(int cond)
+{
+    if (!cond) {
+        fprintf(stderr, "assertion failed at %s:%d\n", __FILE__, __LINE__);
+        fflush(stderr);
+        abort();    // add breakpoint here to catch it
+    }
+}
+#endif
+
 //#define FORCE_GC_AT_MALLOC  /* test the GC by forcing it before each object allocation */
 
 #define check_dump_flag(rt, flag)  ((rt->dump_flags & (flag +0)) == (flag +0))
