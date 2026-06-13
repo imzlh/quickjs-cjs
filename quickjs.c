@@ -87,13 +87,15 @@
 
 #ifdef _MSC_VER
 #undef assert
-static inline void assert(int cond)
-{
-    if (!cond) {
-        fprintf(stderr, "assertion failed at %s:%d\n", __FILE__, __LINE__);
-        fflush(stderr);
-        abort();    // add breakpoint here to catch it
-    }
+void __abort(void) {
+    abort();    // add breakpoint here to capture a stack trace
+}
+#define assert(cond) { \
+    if (!(cond)) { \
+        fprintf(stderr, "assertion failed at %s:%d\n", __FILE__, __LINE__); \
+        fflush(stderr); \
+        __abort(); \
+    } \
 }
 #endif
 
@@ -53307,6 +53309,11 @@ static JSValue js_new_promise_capability(JSContext *ctx,
 JSValue JS_NewPromiseCapability(JSContext *ctx, JSValue *resolving_funcs)
 {
     return js_new_promise_capability(ctx, resolving_funcs, JS_UNDEFINED);
+}
+
+bool JS_PromiseIsHandled(JSContext *ctx, JSValueConst promise) {
+    JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
+    return s && s->is_handled;
 }
 
 static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val,
