@@ -27,6 +27,10 @@ JavaScript runtime for Nintendo Switch homebrew applications.
 
 Rust wrapper focus on embedding-ready and no-pain type conversion and interoperability. 
 
+## [CSPro](https://github.com/csprousers/cspro)
+
+CSPro incorporates the QuickJS-NG engine as its embedded JavaScript runtime for executing logic, complementing its own domain-specific language, CSPro Logic.
+
 ## [GodotJS](https://github.com/godotjs/GodotJS)
 
 This project adds TypeScript/JavaScript support for Godot 4.x. It supports multiple javascript runtimes, including QuickJS-NG.
@@ -74,3 +78,17 @@ JavaScript runtime for the BEAM - Web APIs backed by OTP, native DOM, and a buil
 ## [quickjs-go](https://github.com/buke/quickjs-go)
 
 Golang bindings for QuickJS-NG using cgo
+
+## [Nordstjernen](https://github.com/nordstjernen-web/nordstjernen)
+
+Nordstjernen web browser.
+
+## [quickjs-cpp](https://github.com/qr243vbi/quickjs-cpp)
+
+Header only library for quickjs-ng with modern C++ interface (Archived).
+
+## [NekoBox](https://github.com/qr243vbi/nekobox)
+
+A lightweight proxy client, empowered by sing-box and thrift.
+
+
