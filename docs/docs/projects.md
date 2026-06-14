@@ -82,3 +82,13 @@ Golang bindings for QuickJS-NG using cgo
 ## [Nordstjernen](https://github.com/nordstjernen-web/nordstjernen)
 
 Nordstjernen web browser.
+
+## [quickjs-cpp](https://github.com/qr243vbi/quickjs-cpp)
+
+Header only library for quickjs-ng with modern C++ interface (Archived).
+
+## [NekoBox](https://github.com/qr243vbi/nekobox)
+
+A lightweight proxy client, empowered by sing-box and thrift.
+
+

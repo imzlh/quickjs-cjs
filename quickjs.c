@@ -85,6 +85,20 @@
 #define ENABLE_DUMPS
 #endif
 
+#ifdef _MSC_VER
+#undef assert
+void __abort(void) {
+    abort();    // add breakpoint here to capture a stack trace
+}
+#define assert(cond) { \
+    if (!(cond)) { \
+        fprintf(stderr, "assertion failed at %s:%d\n", __FILE__, __LINE__); \
+        fflush(stderr); \
+        __abort(); \
+    } \
+}
+#endif
+
 //#define FORCE_GC_AT_MALLOC  /* test the GC by forcing it before each object allocation */
 
 #define check_dump_flag(rt, flag)  ((rt->dump_flags & (flag +0)) == (flag +0))
@@ -310,6 +324,9 @@ struct JSRuntime {
     bool in_free;
 
     struct JSStackFrame *current_stack_frame;
+
+	JSBuildBacktraceHook* backtrace_hook;
+	void* backtrace_hook_opaque;
 
     JSInterruptHandler *interrupt_handler;
     void *interrupt_opaque;
@@ -8135,6 +8152,8 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
             goto done;
         if (filename) {
             i++;
+			if (rt->backtrace_hook)
+				rt->backtrace_hook(ctx, filename, &line_num, &col_num);
             dbuf_printf(&dbuf, "    at %s", filename);
             if (line_num != -1)
                 dbuf_printf(&dbuf, ":%d:%d", line_num, col_num);
@@ -8195,8 +8214,11 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
                 atom_str = b->filename ? JS_AtomToCString(ctx, b->filename) : NULL;
                 dbuf_printf(&dbuf, " (%s", atom_str ? atom_str : "<null>");
                 JS_FreeCString(ctx, atom_str);
-                if (line_num1 != -1)
+                if (line_num1 != -1){
+					if (rt->backtrace_hook)
+						rt->backtrace_hook(ctx, atom_str, &line_num1, &col_num1);
                     dbuf_printf(&dbuf, ":%d:%d", line_num1, col_num1);
+				}
                 dbuf_putc(&dbuf, ')');
             } else if (b) {
                 // FIXME(bnoordhuis) Missing `sf->cur_pc = pc` in bytecode
@@ -8268,6 +8290,11 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
 
     JS_FreeValue(ctx, error_obj);
     rt->in_build_stack_trace = false;
+}
+
+void JS_SetBacktraceHook(JSRuntime* rt, JSBuildBacktraceHook* hook, void* opaque){
+	rt->backtrace_hook = hook;
+	rt->backtrace_hook_opaque = opaque;
 }
 
 JSValue JS_NewError(JSContext *ctx)
@@ -30207,6 +30234,25 @@ JSModuleDef *JS_NewCModule(JSContext *ctx, const char *name_str,
     return m;
 }
 
+/* `name_str` may be pure ASCII or UTF-8 encoded */
+JSModuleDef *JS_NewCModule2(JSContext *ctx, const char *name_str)
+{
+    JSModuleDef *m;
+    JSAtom name;
+    name = JS_NewAtom(ctx, name_str);
+    if (name == JS_ATOM_NULL)
+        return NULL;
+    m = js_new_module_def(ctx, name);
+    if (!m)
+        return NULL;
+    m->init_func = (void*)0xffff;			// non-NULL = CModule
+	m->status = JS_MODULE_STATUS_EVALUATED;	// skip init_func executing
+	m->cycle_root = m;
+	m->module_ns = JS_NewObjectProto(ctx, JS_NULL);
+
+	return m;
+}
+
 /* `export_name` may be pure ASCII or UTF-8 encoded */
 int JS_AddModuleExport(JSContext *ctx, JSModuleDef *m, const char *export_name)
 {
@@ -30991,7 +31037,7 @@ static int js_create_module_function(JSContext *ctx, JSModuleDef *m)
         /* initialize the exported variables */
         for(i = 0; i < m->export_entries_count; i++) {
             JSExportEntry *me = &m->export_entries[i];
-            if (me->export_type == JS_EXPORT_TYPE_LOCAL) {
+            if (me->export_type == JS_EXPORT_TYPE_LOCAL && !me->u.local.var_ref) {
                 var_ref = js_create_module_var(ctx, false);
                 if (!var_ref)
                     return -1;
@@ -31081,6 +31127,15 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
     /* check the indirect exports */
     for(i = 0; i < m->export_entries_count; i++) {
         JSExportEntry *me = &m->export_entries[i];
+		#ifdef ENABLE_DUMPS // JS_DUMP_MODULE_RESOLVE
+		if (check_dump_flag(ctx->rt, JS_DUMP_MODULE_RESOLVE)) {
+			char buf1[128], buf2[128];
+			printf("Export: local_name=%s, export_name=%s\n",
+				JS_AtomGetStr(ctx, buf1, sizeof(buf1), m->export_entries[i].local_name),
+				JS_AtomGetStr(ctx, buf2, sizeof(buf2), m->export_entries[i].export_name)
+			);
+		}
+#endif
         if (me->export_type == JS_EXPORT_TYPE_INDIRECT &&
             me->local_name != JS_ATOM__star_) {
             JSResolveResultEnum ret;
@@ -31249,6 +31304,29 @@ static int js_link_module(JSContext *ctx, JSModuleDef *m)
            m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
            m->status == JS_MODULE_STATUS_EVALUATED);
     return 0;
+}
+
+void* JS_DefineModuleExport(JSContext *ctx, JSModuleDef *m, JSAtom name, JSValue val)
+{
+    JSExportEntry *me;
+	
+	// find repeated element
+	me = find_export_entry(ctx, m, name);
+	if(!me) me = add_export_entry2(ctx, NULL, m, name, name, JS_EXPORT_TYPE_LOCAL);
+
+	// create
+	if(!me->u.local.var_ref)
+		me->u.local.var_ref = js_create_module_var(ctx, false);
+    set_value(ctx, me->u.local.var_ref->pvalue, val);
+
+	// also link to nd
+	JS_DefinePropertyValue(ctx, m->module_ns, name, js_dup(val), JS_PROP_C_W_E);
+
+    return me->u.local.var_ref;
+}
+
+void JS_FreeModuleExport(JSRuntime* rt, void* module_var) {
+	free_var_ref(rt, module_var);
 }
 
 /* return JS_ATOM_NULL if the name cannot be found. Only works with
@@ -38395,9 +38473,14 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
         goto fail;
 
     if (s->allow_debug) {
+        int line = b->line_num, col = b->col_num;
+		if (s->ctx->rt->backtrace_hook) {
+			const char* filename = JS_AtomToCString(s->ctx, b->filename);
+			s->ctx->rt->backtrace_hook(s->ctx, filename, &line, &col);
+		}
         bc_put_atom(s, b->filename);
-        bc_put_leb128(s, b->line_num);
-        bc_put_leb128(s, b->col_num);
+        bc_put_leb128(s, line);
+        bc_put_leb128(s, col);
         bc_put_leb128(s, b->pc2line_len);
         dbuf_put(&s->dbuf, b->pc2line_buf, b->pc2line_len);
         if (s->allow_source && b->source) {
@@ -55113,6 +55196,11 @@ JSValue JS_NewPromiseCapability(JSContext *ctx, JSValue *resolving_funcs)
     return js_new_promise_capability(ctx, resolving_funcs, JS_UNDEFINED);
 }
 
+bool JS_PromiseIsHandled(JSContext *ctx, JSValueConst promise) {
+    JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
+    return s && s->is_handled;
+}
+
 static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv, int magic)
 {
@@ -58131,6 +58219,13 @@ static JSValue js_array_buffer_constructor3(JSContext *ctx,
     }
     if (max_len && *max_len > INT32_MAX) {
         JS_ThrowRangeError(ctx, "invalid max array buffer length");
+        goto fail;
+    }
+    if (alloc_flag && class_id == JS_CLASS_SHARED_ARRAY_BUFFER && max_len &&
+        *max_len > len && !rt->sab_funcs.sab_alloc) {
+        JS_ThrowTypeError(ctx,
+                          "growable SharedArrayBuffer requires "
+                          "SAB allocator hooks");
         goto fail;
     }
     abuf = js_malloc(ctx, sizeof(*abuf));

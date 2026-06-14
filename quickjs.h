@@ -68,7 +68,7 @@ extern "C" {
 #  define JS_EXTERN /* nothing */
 # endif
 #else
-# ifdef QUICKJS_NG_CC_GNULIKE
+# if defined(BUILDING_QJS_SHARED) && defined(QUICKJS_NG_CC_GNULIKE)
 #  define JS_EXTERN __attribute__((visibility("default")))
 # else
 #  define JS_EXTERN /* nothing */
@@ -109,7 +109,7 @@ extern "C" {
 #  define JS_MODULE_EXTERN __declspec(dllimport)
 # endif
 #else
-# ifdef QUICKJS_NG_CC_GNULIKE
+# if defined(QUICKJS_NG_MODULE_BUILD) && defined(QUICKJS_NG_CC_GNULIKE)
 #  define JS_MODULE_EXTERN __attribute__((visibility("default")))
 # else
 #  define JS_MODULE_EXTERN /* nothing */
@@ -1021,6 +1021,13 @@ JS_EXTERN bool JS_IsWeakSet(JSValueConst val);
 JS_EXTERN bool JS_IsWeakMap(JSValueConst val);
 JS_EXTERN bool JS_IsDataView(JSValueConst val);
 
+#define ISDEF(name, id) JS_EXTERN bool JS_Is ##name(JSValue val);
+ISDEF(Set, JS_CLASS_SET);
+ISDEF(WeakSet, JS_CLASS_WEAKSET);
+ISDEF(WeakMap, JS_CLASS_WEAKMAP);
+ISDEF(WeakRef, JS_CLASS_WEAK_REF);
+#undef ISDEF
+
 JS_EXTERN JSValue JS_NewArray(JSContext *ctx);
 // takes ownership of the values
 JS_EXTERN JSValue JS_NewArrayFrom(JSContext *ctx, int count,
@@ -1196,6 +1203,7 @@ typedef enum JSPromiseStateEnum {
 } JSPromiseStateEnum;
 
 JS_EXTERN JSValue JS_NewPromiseCapability(JSContext *ctx, JSValue *resolving_funcs);
+JS_EXTERN bool JS_PromiseIsHandled(JSContext *ctx, JSValueConst promise);
 JS_EXTERN JSPromiseStateEnum JS_PromiseState(JSContext *ctx,
                                              JSValueConst promise);
 JS_EXTERN JSValue JS_PromiseResult(JSContext *ctx, JSValueConst promise);
@@ -1234,6 +1242,9 @@ JS_EXTERN void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, voi
 JS_EXTERN void JS_SetCanBlock(JSRuntime *rt, bool can_block);
 /* set the [IsHTMLDDA] internal slot */
 JS_EXTERN void JS_SetIsHTMLDDA(JSContext *ctx, JSValueConst obj);
+
+typedef void JSBuildBacktraceHook(JSContext* ctx, const char* name, int* line, int* col);
+JS_EXTERN void JS_SetBacktraceHook(JSRuntime* rt, JSBuildBacktraceHook* hook, void* opaque);
 
 typedef struct JSModuleDef JSModuleDef;
 
@@ -1486,10 +1497,13 @@ typedef int JSModuleInitFunc(JSContext *ctx, JSModuleDef *m);
 
 JS_EXTERN JSModuleDef *JS_NewCModule(JSContext *ctx, const char *name_str,
                                      JSModuleInitFunc *func);
+JS_EXTERN JSModuleDef *JS_NewCModule2(JSContext *ctx, const char *name_str);
 /* can only be called before the module is instantiated */
 JS_EXTERN int JS_AddModuleExport(JSContext *ctx, JSModuleDef *m, const char *name_str);
 JS_EXTERN int JS_AddModuleExportList(JSContext *ctx, JSModuleDef *m,
                                       const JSCFunctionListEntry *tab, int len);
+JS_EXTERN void* JS_DefineModuleExport(JSContext *ctx, JSModuleDef *m, JSAtom name, JSValue val);
+JS_EXTERN void JS_FreeModuleExport(JSRuntime* rt, void* module_var);
 /* can only be called after the module is instantiated */
 JS_EXTERN int JS_SetModuleExport(JSContext *ctx, JSModuleDef *m, const char *export_name,
                                  JSValue val);
@@ -1500,7 +1514,7 @@ JS_EXTERN int JS_SetModuleExportList(JSContext *ctx, JSModuleDef *m,
 
 #define QJS_VERSION_MAJOR 0
 #define QJS_VERSION_MINOR 15
-#define QJS_VERSION_PATCH 0
+#define QJS_VERSION_PATCH 1
 #define QJS_VERSION_SUFFIX ""
 
 JS_EXTERN const char* JS_GetVersion(void);
