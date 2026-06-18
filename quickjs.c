@@ -85,7 +85,7 @@
 #define ENABLE_DUMPS
 #endif
 
-#ifdef _MSC_VER
+#if defined(_MSC_VER) && !defined(NDEBUG)
 #undef assert
 void __abort(void) {
     abort();    // add breakpoint here to capture a stack trace
@@ -559,6 +559,9 @@ struct JSContext {
 
     JSDebugTraceFunc *debug_trace;
     void *debug_trace_opaque;
+
+    JSDebugThrowHook *debug_throw_hook;
+    void *debug_throw_opaque;
 };
 
 typedef union JSFloat64Union {
@@ -2620,6 +2623,8 @@ void JS_SetDebugTraceHandler(JSContext *ctx, JSDebugTraceFunc *cb, void *opaque)
     ctx->debug_trace_opaque = opaque;
 }
 
+static bool js_class_has_bytecode(JSClassID class_id);
+
 static JSStackFrame *js_get_stack_frame_at_level(JSContext *ctx, int level)
 {
     JSRuntime *rt = ctx->rt;
@@ -2667,7 +2672,7 @@ int JS_GetLocalVariablesAtLevel(JSContext *ctx, int level,
         return 0;
 
     JSObject *p = JS_VALUE_GET_OBJ(func);
-    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
+    if (!js_class_has_bytecode(p->class_id))
         return 0;
 
     JSFunctionBytecode *b = p->u.func.function_bytecode;
@@ -2780,6 +2785,11 @@ void JS_FreeLocalVariables(JSContext *ctx, JSDebugLocalVar *vars, int count)
     js_free(ctx, vars);
 }
 
+JSValue JS_GetGlobalLexicalVariables(JSContext *ctx)
+{
+    return js_dup(ctx->global_var_obj);
+}
+
 int JS_SetVariableAtLevel(JSContext *ctx, int level,
                           const char *name, JSValue value)
 {
@@ -2800,7 +2810,7 @@ int JS_SetVariableAtLevel(JSContext *ctx, int level,
         return -1;
     }
     JSObject *p = JS_VALUE_GET_OBJ(func);
-    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION) {
+    if (!js_class_has_bytecode(p->class_id)) {
         JS_FreeValue(ctx, value);
         return -1;
     }
@@ -2886,7 +2896,7 @@ JSValue JS_EvalInStackFrame(JSContext *ctx, int level,
                                  "stack frame at level %d is not a JS function",
                                  level);
     JSObject *p = JS_VALUE_GET_OBJ(target->cur_func);
-    if (p->class_id != JS_CLASS_BYTECODE_FUNCTION)
+    if (!js_class_has_bytecode(p->class_id))
         return JS_ThrowTypeError(ctx,
                                  "stack frame at level %d is not a JS function",
                                  level);
@@ -7918,9 +7928,20 @@ JSValue JS_GetGlobalObject(JSContext *ctx)
 JSValue JS_Throw(JSContext *ctx, JSValue obj)
 {
     JSRuntime *rt = ctx->rt;
+
+    if (unlikely(ctx->debug_throw_hook)) {
+        ctx->debug_throw_hook(ctx, obj, ctx->debug_throw_opaque);
+    }
+
     JS_FreeValue(ctx, rt->current_exception);
     rt->current_exception = obj;
     return JS_EXCEPTION;
+}
+
+void JS_SetDebugThrowHook(JSContext *ctx, JSDebugThrowHook *cb, void *opaque)
+{
+    ctx->debug_throw_hook = cb;
+    ctx->debug_throw_opaque = opaque;
 }
 
 /* return the pending exception (cannot be called twice). */
@@ -8292,9 +8313,62 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     rt->in_build_stack_trace = false;
 }
 
+void __dbg_stack(JSRuntime *rt)
+{
+    JSStackFrame *sf;
+    if (!rt) return;
+    if (rt->in_build_stack_trace) {
+        fprintf(stderr, "<recursive>\n");
+        return;
+    }
+    rt->in_build_stack_trace = true;
+    sf = rt->current_stack_frame;
+    int i = 0;
+    while (sf && i < 100) {
+        JSObject *p = JS_VALUE_GET_OBJ(sf->cur_func);
+        int line = -1, col = 0;
+        if (p && js_class_has_bytecode(p->class_id)) {
+            JSFunctionBytecode *b = p->u.func.function_bytecode;
+            if (b && sf->cur_pc) {
+                uint32_t pc = sf->cur_pc - b->byte_code_buf - 1;
+                line = find_line_num(NULL, b, pc, &col);
+            }
+        }
+        if (line != -1)
+            fprintf(stderr, "    %d:%d\n", line, col);
+        else
+            fprintf(stderr, "    ??\n");
+        sf = sf->prev_frame;
+        i++;
+    }
+    rt->in_build_stack_trace = false;
+}
+
 void JS_SetBacktraceHook(JSRuntime* rt, JSBuildBacktraceHook* hook, void* opaque){
 	rt->backtrace_hook = hook;
 	rt->backtrace_hook_opaque = opaque;
+}
+
+JSFrameInfo JS_GetStackFrame(JSContext *ctx, int level) {
+    JSStackFrame *sf = js_get_stack_frame_at_level(ctx, level);
+    if (!sf) return (JSFrameInfo){ .line_num = -1, 0 };
+
+    JSObject *p = JS_VALUE_GET_OBJ(sf->cur_func);
+    int line = -1, col = 0;
+    JSAtom file_path = JS_ATOM_NULL;
+    JSFunctionBytecode *b = JS_GetFunctionBytecode(sf->cur_func);
+    if (b && sf->cur_pc) {
+        uint32_t pc = sf->cur_pc - b->byte_code_buf - 1;
+        line = find_line_num(ctx, b, pc, &col);
+        file_path = b->filename;
+    }
+    
+    return (JSFrameInfo) {
+        .func = js_dup(sf->cur_func),
+        .line_num = line,
+        .col_num = col,
+        .func_path = file_path
+    };
 }
 
 JSValue JS_NewError(JSContext *ctx)
@@ -23775,16 +23849,13 @@ static void emit_source_loc(JSParseState *s)
 
 static void emit_debug(JSParseState *s)
 {
-    if (unlikely(s->ctx->debug_trace))
-        dbuf_putc(&s->cur_func->byte_code, OP_debug);
+    dbuf_putc(&s->cur_func->byte_code, OP_debug);
 }
 
 static void emit_source_loc_debug(JSParseState *s)
 {
-    if (unlikely(s->ctx->debug_trace)) {
-        emit_source_loc(s);
-        emit_debug(s);
-    }
+    emit_source_loc(s);
+    emit_debug(s);
 }
 
 static void emit_op(JSParseState *s, uint8_t val)
@@ -38116,7 +38187,7 @@ typedef enum BCTagEnum {
     BC_TAG_SYMBOL,
 } BCTagEnum;
 
-#define BC_VERSION 26
+#define BC_VERSION 27
 
 typedef struct BCWriterState {
     JSContext *ctx;

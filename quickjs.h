@@ -593,6 +593,16 @@ JS_EXTERN int JS_GetLocalVariablesAtLevel(JSContext *ctx, int level,
 /* Free local variables array returned by JS_GetLocalVariablesAtLevel */
 JS_EXTERN void JS_FreeLocalVariables(JSContext *ctx, JSDebugLocalVar *vars, int count);
 
+/* Get global lexical variables object (module-level let/const/class declarations). */
+JS_EXTERN JSValue JS_GetGlobalLexicalVariables(JSContext *ctx);
+
+/* Exception breakpoint hook — invoked inside JS_Throw().
+   Return 0 to let the throw proceed normally.
+   Return non-zero to signal that the debugger wants to pause;
+   the exception is still set on the context (not swallowed). */
+typedef int JSDebugThrowHook(JSContext *ctx, JSValueConst exception, void *opaque);
+JS_EXTERN void JS_SetDebugThrowHook(JSContext *ctx, JSDebugThrowHook *cb, void *opaque);
+
 /* Set a local or closure variable in a stack frame by name.
    Returns 0 on success, -1 if the variable is not found, -2 if it is a const
    binding (read-only), or -3 on type/argument errors. */
@@ -613,6 +623,19 @@ JS_EXTERN int JS_SetVariableAtLevel(JSContext *ctx, int level,
 JS_EXTERN JSValue JS_EvalInStackFrame(JSContext *ctx, int level,
                                       const char *input, size_t input_len,
                                       const char *filename);
+
+typedef struct JSFrameInfo {
+    int line_num;
+    int col_num;
+    JSAtom func_path;
+
+    JSValue func;
+} JSFrameInfo;
+
+/**
+ * Get the stack frame info at a specific stack level (0 = current frame, 1 = caller, etc.)
+ */
+JS_EXTERN JSFrameInfo JS_GetStackFrame(JSContext *ctx, int level);
 
 /* the following functions are used to select the intrinsic object to
    save memory */
