@@ -572,6 +572,7 @@ typedef struct JSDebugLocalVar {
     JSValue value;
     bool is_arg;
     bool is_closure;       /* true if captured from an enclosing scope */
+    bool is_uninitialized; /* true if the variable is in the temporal dead zone (let/const before declaration) */
     int scope_level;
 } JSDebugLocalVar;
 
@@ -600,14 +601,22 @@ JS_EXTERN JSValue JS_GetGlobalLexicalVariables(JSContext *ctx);
    Return 0 to let the throw proceed normally.
    Return non-zero to signal that the debugger wants to pause;
    the exception is still set on the context (not swallowed). */
-typedef int JSDebugThrowHook(JSContext *ctx, JSValueConst exception, void *opaque);
+enum {
+    JS_DEBUG_THROW_AT_THROW = 0,
+    JS_DEBUG_THROW_CAUGHT_IN_FRAME = 1,
+    JS_DEBUG_THROW_UNCAUGHT_IN_FRAME = 2,
+};
+typedef int JSDebugThrowHook(JSContext *ctx, JSValueConst exception,
+                             int throw_state, void *opaque);
 JS_EXTERN void JS_SetDebugThrowHook(JSContext *ctx, JSDebugThrowHook *cb, void *opaque);
 
 /* Set a local or closure variable in a stack frame by name.
+   scopeNumber: <0 searches all (legacy), 0=args+locals, 1=closures, 2=global.
    Returns 0 on success, -1 if the variable is not found, -2 if it is a const
    binding (read-only), or -3 on type/argument errors. */
 JS_EXTERN int JS_SetVariableAtLevel(JSContext *ctx, int level,
-                                    const char *name, JSValue value);
+                                    const char *name, JSValue value,
+                                    int scopeNumber);
 
 /* Evaluate an expression in the context of the given stack frame.
    The expression has access to the frame's local and closure variables.
@@ -636,6 +645,14 @@ typedef struct JSFrameInfo {
  * Get the stack frame info at a specific stack level (0 = current frame, 1 = caller, etc.)
  */
 JS_EXTERN JSFrameInfo JS_GetStackFrame(JSContext *ctx, int level);
+
+/**
+ * Like JS_GetStackFrame but corrects for pre-execution position (debug trace callback).
+ * Use this variant for level 0 when called from inside a JSDebugTraceFunc, where
+ * cur_pc points to the instruction about to execute rather than past it.
+ * For caller frames (level > 0) JS_GetStackFrame is correct.
+ */
+JS_EXTERN JSFrameInfo JS_GetStackFrameDebug(JSContext *ctx, int level);
 
 /* the following functions are used to select the intrinsic object to
    save memory */

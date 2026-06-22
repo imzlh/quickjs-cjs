@@ -2701,11 +2701,8 @@ int JS_GetLocalVariablesAtLevel(JSContext *ctx, int level,
         if (unlikely(!name_str_))                                         \
             goto fail;                                                    \
         vars[idx].name = name_str_;                                       \
-        /* Do not expose the internal TDZ sentinel to C callers. */        \
-        if (JS_VALUE_GET_TAG(value_) == JS_TAG_UNINITIALIZED)             \
-            vars[idx].value = JS_UNDEFINED;                               \
-        else                                                              \
-            vars[idx].value = js_dup(value_);                             \
+        vars[idx].is_uninitialized = (JS_VALUE_GET_TAG(value_) == JS_TAG_UNINITIALIZED); \
+        vars[idx].value = vars[idx].is_uninitialized ? JS_UNDEFINED : js_dup(value_); \
         vars[idx].is_arg = (is_arg_);                                     \
         vars[idx].is_closure = false;                                     \
         vars[idx].scope_level = (vd_)->scope_level;                       \
@@ -2740,13 +2737,17 @@ int JS_GetLocalVariablesAtLevel(JSContext *ctx, int level,
             if (unlikely(!name_str))
                 goto fail;
             JSValue cv_val = JS_UNDEFINED;
+            bool cv_uninit = false;
             if (var_refs && var_refs[i] && var_refs[i]->pvalue) {
                 JSValue v = *var_refs[i]->pvalue;
-                if (JS_VALUE_GET_TAG(v) != JS_TAG_UNINITIALIZED)
+                if (JS_VALUE_GET_TAG(v) == JS_TAG_UNINITIALIZED)
+                    cv_uninit = true;
+                else
                     cv_val = js_dup(v);
             }
             vars[idx].name = name_str;
             vars[idx].value = cv_val;
+            vars[idx].is_uninitialized = cv_uninit;
             vars[idx].is_arg = false;
             vars[idx].is_closure = true;
             vars[idx].scope_level = 0;
@@ -2791,7 +2792,7 @@ JSValue JS_GetGlobalLexicalVariables(JSContext *ctx)
 }
 
 int JS_SetVariableAtLevel(JSContext *ctx, int level,
-                          const char *name, JSValue value)
+                          const char *name, JSValue value, int scopeNumber)
 {
     if (!name) {
         JS_FreeValue(ctx, value);
@@ -2824,35 +2825,41 @@ int JS_SetVariableAtLevel(JSContext *ctx, int level,
 
     int rc = -1;
 
-    /* Search arguments. */
-    for (int i = 0; i < b->arg_count; i++) {
-        if (b->vardefs[i].var_name == target_atom) {
-            JSValue old = sf->arg_buf[i];
-            sf->arg_buf[i] = js_dup(value);
-            JS_FreeValue(ctx, old);
-            rc = 0;
-            goto done;
-        }
-    }
+    /* scopeNumber <  0 : search all (legacy)
+       scopeNumber == 0 : args + locals only (CDP local scope)
+       scopeNumber == 1 : closures only (CDP closure scope) */
 
-    /* Search locals. */
-    for (int i = 0; i < b->var_count; i++) {
-        JSVarDef *vd = &b->vardefs[b->arg_count + i];
-        if (vd->var_name == target_atom) {
-            if (vd->is_const) {
-                rc = -2;
+    if (scopeNumber <= 0) {
+        /* Search arguments. */
+        for (int i = 0; i < b->arg_count; i++) {
+            if (b->vardefs[i].var_name == target_atom) {
+                JSValue old = sf->arg_buf[i];
+                sf->arg_buf[i] = js_dup(value);
+                JS_FreeValue(ctx, old);
+                rc = 0;
                 goto done;
             }
-            JSValue old = sf->var_buf[i];
-            sf->var_buf[i] = js_dup(value);
-            JS_FreeValue(ctx, old);
-            rc = 0;
-            goto done;
+        }
+
+        /* Search locals. */
+        for (int i = 0; i < b->var_count; i++) {
+            JSVarDef *vd = &b->vardefs[b->arg_count + i];
+            if (vd->var_name == target_atom) {
+                if (vd->is_const) {
+                    rc = -2;
+                    goto done;
+                }
+                JSValue old = sf->var_buf[i];
+                sf->var_buf[i] = js_dup(value);
+                JS_FreeValue(ctx, old);
+                rc = 0;
+                goto done;
+            }
         }
     }
 
-    /* Search closure vars. */
-    {
+    if (scopeNumber < 0 || scopeNumber == 1) {
+        /* Search closure vars. */
         JSVarRef **var_refs = p->u.func.var_refs;
         for (int i = 0; i < b->closure_var_count; i++) {
             JSClosureVar *cv = &b->closure_var[i];
@@ -7930,7 +7937,8 @@ JSValue JS_Throw(JSContext *ctx, JSValue obj)
     JSRuntime *rt = ctx->rt;
 
     if (unlikely(ctx->debug_throw_hook)) {
-        ctx->debug_throw_hook(ctx, obj, ctx->debug_throw_opaque);
+        ctx->debug_throw_hook(ctx, obj, JS_DEBUG_THROW_AT_THROW,
+                              ctx->debug_throw_opaque);
     }
 
     JS_FreeValue(ctx, rt->current_exception);
@@ -8362,7 +8370,7 @@ JSFrameInfo JS_GetStackFrame(JSContext *ctx, int level) {
         line = find_line_num(ctx, b, pc, &col);
         file_path = b->filename;
     }
-    
+
     return (JSFrameInfo) {
         .func = js_dup(sf->cur_func),
         .line_num = line,
@@ -18105,6 +18113,13 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                                 ? JS_DEBUG_TRACE_DEBUGGER_STMT : 0;
                 line_num = find_line_num(ctx, b, pc_index, &col_num);
 
+                /* Keep sf->cur_pc consistent so that build_backtrace() and
+                   JS_GetStackFrame() see the correct line while inside the
+                   trace callback.  pc is already past the 1-byte opcode, so
+                   cur_pc - 1 lands exactly on the opcode byte, matching the
+                   pc_index used for line_num above. */
+                sf->cur_pc = pc;
+
                 /* Pass the JSAtom values directly — no heap allocation.
                    The atoms are valid for the lifetime of the bytecode
                    object, which outlives the callback.  The embedder must
@@ -18624,6 +18639,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             BREAK;
 
         CASE(OP_throw):
+            sf->cur_pc = pc;
             JS_Throw(ctx, *--sp);
             goto exception;
 
@@ -18636,9 +18652,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
             {
                 JSAtom atom;
                 int type;
+                uint8_t *throw_pc;
+                throw_pc = pc;
                 atom = get_u32(pc);
                 type = pc[4];
                 pc += 5;
+                sf->cur_pc = throw_pc;
                 if (type == JS_THROW_VAR_RO)
                     JS_ThrowTypeErrorReadOnly(ctx, JS_PROP_THROW, atom);
                 else
@@ -20756,9 +20775,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
         }
     }
  exception:
+    sf->cur_pc = pc;
     if (needs_backtrace(rt->current_exception)
     || JS_IsUndefined(ctx->error_back_trace)) {
-        sf->cur_pc = pc;
         build_backtrace(ctx, rt->current_exception, JS_UNDEFINED,
                         NULL, 0, 0, 0);
     }
@@ -20774,6 +20793,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     sp--;
                     JS_IteratorClose(ctx, sp[-1], true);
                 } else {
+                    if (unlikely(ctx->debug_throw_hook)) {
+                        ctx->debug_throw_hook(ctx, rt->current_exception,
+                                              JS_DEBUG_THROW_CAUGHT_IN_FRAME,
+                                              ctx->debug_throw_opaque);
+                    }
                     *sp++ = rt->current_exception;
                     rt->current_exception = JS_UNINITIALIZED;
                     JS_FreeValueRT(rt, ctx->error_back_trace);
@@ -20782,6 +20806,12 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     goto restart;
                 }
             }
+        }
+        if (unlikely(ctx->debug_throw_hook) &&
+            !JS_IsUninitialized(rt->current_exception)) {
+            ctx->debug_throw_hook(ctx, rt->current_exception,
+                                  JS_DEBUG_THROW_UNCAUGHT_IN_FRAME,
+                                  ctx->debug_throw_opaque);
         }
     }
     ret_val = JS_EXCEPTION;
@@ -35605,11 +35635,21 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
         case OP_return:
         case OP_return_undef:
         case OP_return_async:
-        case OP_throw:
-        case OP_throw_error:
             pos_next = skip_dead_code(s, bc_buf, bc_len, pos_next,
                                       &line_num, &col_num);
             goto no_change;
+
+        case OP_throw:
+        case OP_throw_error:
+            {
+                int throw_line_num = line_num;
+                int throw_col_num = col_num;
+                pos_next = skip_dead_code(s, bc_buf, bc_len, pos_next,
+                                          &line_num, &col_num);
+                add_pc2line_info(s, bc_out.size, throw_line_num, throw_col_num);
+                dbuf_put(&bc_out, bc_buf + pos, len);
+            }
+            break;
 
         case OP_goto:
             label = get_u32(bc_buf + pos + 1);
