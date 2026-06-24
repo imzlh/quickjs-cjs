@@ -366,7 +366,7 @@ static inline double fromfp16(uint16_t v) {
     double d, s;
     int e;
     if ((v & 0x7C00) == 0x7C00) {
-        d = (v & 0x3FF) ? NAN : INFINITY;
+        d = (v & 0x3FF) ? (double)NAN : (double)INFINITY;
     } else {
         d = (v & 0x3FF) / 1024.;
         e = (v & 0x7C00) >> 10;
