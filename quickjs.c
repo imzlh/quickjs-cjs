@@ -8361,7 +8361,6 @@ JSFrameInfo JS_GetStackFrame(JSContext *ctx, int level) {
     JSStackFrame *sf = js_get_stack_frame_at_level(ctx, level);
     if (!sf) return (JSFrameInfo){ .line_num = -1, 0 };
 
-    JSObject *p = JS_VALUE_GET_OBJ(sf->cur_func);
     int line = -1, col = 0;
     JSAtom file_path = JS_ATOM_NULL;
     JSFunctionBytecode *b = JS_GetFunctionBytecode(sf->cur_func);
