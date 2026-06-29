@@ -50,6 +50,15 @@ function test_exception_prepare_stack()
     assert(f.getLineNumber(), 39);
     assert(f.getColumnNumber(), 19);
     assert(!f.isNative());
+    assert(!f.isEval());
+    assert(!f.isAsync());
+    assert(f.getEvalOrigin(), undefined);
+    assert(f.getThis(), undefined);
+    assert(f.getTypeName(), undefined);
+    assert(f.getMethodName(), undefined);
+    assert(f.getScriptNameOrSourceURL().endsWith('test_builtin.js'));
+    assert(f.toString().includes('test_exception_prepare_stack'));
+    assert(f.toString().includes('test_builtin.js:39:19'));
 }
 
 // Keep this at the top; it tests source positions.

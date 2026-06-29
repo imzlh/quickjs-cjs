@@ -993,6 +993,14 @@ JS_EXTERN int JS_ToFloat64(JSContext *ctx, double *pres, JSValueConst val);
 /* return an exception if 'val' is a Number */
 JS_EXTERN int JS_ToBigInt64(JSContext *ctx, int64_t *pres, JSValueConst val);
 JS_EXTERN int JS_ToBigUint64(JSContext *ctx, uint64_t *pres, JSValueConst val);
+/* BigInt <-> sign-magnitude 64-bit words (Node-API napi_*_bigint_words layout:
+ * little-endian uint64 words, magnitude only, separate sign flag). On query,
+ * pass words==NULL to receive the required word_count. */
+JS_EXTERN int JS_GetBigIntWordCount(JSContext *ctx, JSValueConst val, size_t *pcount);
+JS_EXTERN int JS_GetBigIntWords(JSContext *ctx, JSValueConst val, int *psign,
+                                size_t *pcount, uint64_t *words);
+JS_EXTERN JSValue JS_NewBigIntWords(JSContext *ctx, int sign, size_t count,
+                                    const uint64_t *words);
 /* same as JS_ToInt64() but allow BigInt */
 JS_EXTERN int JS_ToInt64Ext(JSContext *ctx, int64_t *pres, JSValueConst val);
 
@@ -1060,13 +1068,8 @@ JS_EXTERN bool JS_IsWeakRef(JSValueConst val);
 JS_EXTERN bool JS_IsWeakSet(JSValueConst val);
 JS_EXTERN bool JS_IsWeakMap(JSValueConst val);
 JS_EXTERN bool JS_IsDataView(JSValueConst val);
-
-#define ISDEF(name, id) JS_EXTERN bool JS_Is ##name(JSValue val);
-ISDEF(Set, JS_CLASS_SET);
-ISDEF(WeakSet, JS_CLASS_WEAKSET);
-ISDEF(WeakMap, JS_CLASS_WEAKMAP);
-ISDEF(WeakRef, JS_CLASS_WEAK_REF);
-#undef ISDEF
+JS_EXTERN JSValue JS_NewWeakRef(JSContext *ctx, JSValueConst target);
+JS_EXTERN JSValue JS_WeakRefDeref(JSContext *ctx, JSValueConst val);
 
 JS_EXTERN JSValue JS_NewArray(JSContext *ctx);
 // takes ownership of the values

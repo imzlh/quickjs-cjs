@@ -13709,6 +13709,98 @@ static JSValue JS_CompactBigInt(JSContext *ctx, JSBigInt *p)
     }
 }
 
+/* read a BigInt as sign-magnitude little-endian 64-bit words.
+ * Returns 0 on success, -1 if 'val' is not a BigInt. With words==NULL only
+ * *word_count is written (query mode). Two 32-bit limbs map to one 64-bit
+ * word. */
+int JS_GetBigIntWords(JSContext *ctx, JSValueConst val, int *psign,
+                      size_t *pcount, uint64_t *words)
+{
+    JSBigInt *neg = NULL;
+    const JSBigInt *mag;
+    JSBigIntBuf buf;
+    JSBigInt *p;
+    size_t need, i, navail;
+    int sign;
+
+    if (JS_VALUE_GET_TAG(val) == JS_TAG_SHORT_BIG_INT) {
+        p = js_bigint_set_si(&buf, JS_VALUE_GET_SHORT_BIG_INT(val));
+    } else if (JS_VALUE_GET_TAG(val) == JS_TAG_BIG_INT) {
+        p = JS_VALUE_GET_PTR(val);
+    } else {
+        return -1;
+    }
+
+    sign = js_bigint_sign(p);
+    if (sign) {
+        neg = js_bigint_neg(ctx, p);
+        if (!neg)
+            return -1;
+        mag = neg;
+    } else {
+        mag = p;
+    }
+
+    need = ((size_t)mag->len + 1) >> 1;
+    if (psign)
+        *psign = sign;
+    if (words) {
+        navail = pcount ? *pcount : 0;
+        for (i = 0; i < need && i < navail; i++) {
+            uint64_t lo = mag->tab[2 * i];
+            uint64_t hi = (2 * i + 1 < (size_t)mag->len) ? mag->tab[2 * i + 1] : 0;
+            words[i] = lo | (hi << 32);
+        }
+    }
+    if (pcount)
+        *pcount = need;
+    if (neg)
+        js_free(ctx, neg);
+    return 0;
+}
+
+int JS_GetBigIntWordCount(JSContext *ctx, JSValueConst val, size_t *pcount)
+{
+    return JS_GetBigIntWords(ctx, val, NULL, pcount, NULL);
+}
+
+/* N-API support: build a BigInt from sign-magnitude little-endian 64-bit
+ * words. Returns JS_EXCEPTION on allocation failure. */
+JSValue JS_NewBigIntWords(JSContext *ctx, int sign, size_t count,
+                          const uint64_t *words)
+{
+    JSBigInt *p, *neg;
+    size_t nlimbs, i;
+
+    if (count == 0)
+        return __JS_NewShortBigInt(ctx, 0);
+
+    /* two limbs per word, plus one zero limb so a high bit in the top word is
+     * not misread as a negative two's-complement sign. normalize trims it. */
+    nlimbs = count * 2 + 1;
+    p = js_bigint_new(ctx, nlimbs);
+    if (!p)
+        return JS_EXCEPTION;
+    for (i = 0; i < count; i++) {
+        p->tab[2 * i]     = (js_limb_t)(words[i] & 0xffffffff);
+        p->tab[2 * i + 1] = (js_limb_t)(words[i] >> 32);
+    }
+    p->tab[nlimbs - 1] = 0; /* force non-negative magnitude */
+
+    if (sign) {
+        neg = js_bigint_neg(ctx, p);
+        js_free(ctx, p);
+        if (!neg)
+            return JS_EXCEPTION;
+        p = neg;
+    }
+
+    p = js_bigint_normalize(ctx, p);
+    if (!p)
+        return JS_EXCEPTION;
+    return JS_CompactBigInt(ctx, p);
+}
+
 #define ATOD_INT_ONLY        (1 << 0)
 /* accept Oo and Ob prefixes in addition to 0x prefix if radix = 0 */
 #define ATOD_ACCEPT_BIN_OCT  (1 << 2)
@@ -62225,6 +62317,50 @@ static const JSCFunctionListEntry js_weakref_proto_funcs[] = {
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "WeakRef", JS_PROP_CONFIGURABLE ),
 };
 
+/* C-level WeakRef constructor. Returns a JS_CLASS_WEAK_REF object holding a
+ * weak reference to 'target' (which must be an object or symbol). Returns
+ * JS_EXCEPTION on invalid target or OOM. Mirrors js_weakref_constructor but
+ * callable from host C code (e.g. the Node-API layer). */
+JSValue JS_NewWeakRef(JSContext *ctx, JSValueConst target)
+{
+    if (!is_valid_weakref_target(target))
+        return JS_ThrowTypeError(ctx, "invalid WeakRef target");
+    JSValue obj = JS_NewObjectClass(ctx, JS_CLASS_WEAK_REF);
+    if (JS_IsException(obj))
+        return JS_EXCEPTION;
+    JSWeakRefData *wrd = js_malloc(ctx, sizeof(*wrd));
+    if (!wrd) {
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
+    JSWeakRefRecord *wr = js_malloc(ctx, sizeof(*wr));
+    if (!wr) {
+        JS_FreeValue(ctx, obj);
+        js_free(ctx, wrd);
+        return JS_EXCEPTION;
+    }
+    wrd->target = target;
+    wrd->obj = obj;
+    wr->kind = JS_WEAK_REF_KIND_WEAK_REF;
+    wr->u.weak_ref_data = wrd;
+    insert_weakref_record(target, wr);
+    JS_SetOpaqueInternal(obj, wrd);
+    return obj;
+}
+
+/* Dereference a weak ref created by JS_NewWeakRef. Returns a dup'd strong
+ * reference to the target, or JS_UNDEFINED if it has been collected. Returns
+ * JS_EXCEPTION if 'val' is not a WeakRef. */
+JSValue JS_WeakRefDeref(JSContext *ctx, JSValueConst val)
+{
+    JSWeakRefData *wrd = JS_GetOpaque2(ctx, val, JS_CLASS_WEAK_REF);
+    if (!wrd)
+        return JS_EXCEPTION;
+    if (wrd == &js_weakref_sentinel)
+        return JS_UNDEFINED;
+    return js_dup(wrd->target);
+}
+
 static const JSClassShortDef js_weakref_class_def[] = {
     { JS_ATOM_WeakRef, js_weakref_finalizer, NULL }, /* JS_CLASS_WEAK_REF */
 };
@@ -62689,13 +62825,124 @@ static JSValue js_callsite_getnumber(JSContext *ctx, JSValueConst this_val, int 
     return js_int32(*field);
 }
 
+static JSValue js_callsite_return_false(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
+    if (!csd)
+        return JS_EXCEPTION;
+    return JS_FALSE;
+}
+
+static JSValue js_callsite_return_undefined(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
+    if (!csd)
+        return JS_EXCEPTION;
+    return JS_UNDEFINED;
+}
+
+static JSValue js_callsite_return_null(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
+    if (!csd)
+        return JS_EXCEPTION;
+    return JS_NULL;
+}
+
+static JSValue js_callsite_getscriptname(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
+    if (!csd)
+        return JS_EXCEPTION;
+    return js_dup(csd->filename);
+}
+
+static JSValue js_callsite_istoplevel(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
+    if (!csd)
+        return JS_EXCEPTION;
+    return js_bool(JS_IsNull(csd->func_name) || JS_IsUndefined(csd->func_name));
+}
+
+static JSValue js_callsite_isasync(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
+    JSFunctionBytecode *b;
+    JSObject *p;
+    if (!csd)
+        return JS_EXCEPTION;
+    if (JS_VALUE_GET_TAG(csd->func) != JS_TAG_OBJECT)
+        return JS_FALSE;
+    p = JS_VALUE_GET_OBJ(csd->func);
+    if (!js_class_has_bytecode(p->class_id))
+        return JS_FALSE;
+    b = p->u.func.function_bytecode;
+    return js_bool((b->func_kind & JS_FUNC_ASYNC) != 0);
+}
+
+static JSValue js_callsite_toString(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
+    DynBuf dbuf;
+    const char *func_name = NULL;
+    const char *file_name = NULL;
+    JSValue ret;
+
+    if (!csd)
+        return JS_EXCEPTION;
+
+    if (!JS_IsNull(csd->func_name) && !JS_IsUndefined(csd->func_name))
+        func_name = JS_ToCString(ctx, csd->func_name);
+    if (!JS_IsNull(csd->filename) && !JS_IsUndefined(csd->filename))
+        file_name = JS_ToCString(ctx, csd->filename);
+
+    if (!func_name && !file_name)
+        return JS_NewString(ctx, "<anonymous>");
+
+    js_dbuf_init(ctx, &dbuf);
+    if (func_name && func_name[0] != '\0')
+        dbuf_printf(&dbuf, "%s", func_name);
+    if (file_name && file_name[0] != '\0') {
+        if (func_name && func_name[0] != '\0')
+            dbuf_printf(&dbuf, " (%s", file_name);
+        else
+            dbuf_printf(&dbuf, "%s", file_name);
+        if (csd->line_num >= 0) {
+            dbuf_printf(&dbuf, ":%d", csd->line_num);
+            if (csd->col_num >= 0)
+                dbuf_printf(&dbuf, ":%d", csd->col_num);
+        }
+        if (func_name && func_name[0] != '\0')
+            dbuf_putc(&dbuf, ')');
+    }
+
+    ret = JS_NewStringLen(ctx, (char *)dbuf.buf, dbuf.size);
+    dbuf_free(&dbuf);
+    JS_FreeCString(ctx, func_name);
+    JS_FreeCString(ctx, file_name);
+    return ret;
+}
+
 static const JSCFunctionListEntry js_callsite_proto_funcs[] = {
+    JS_CFUNC_DEF("toString", 0, js_callsite_toString),
     JS_CFUNC_DEF("isNative", 0, js_callsite_isnative),
+    JS_CFUNC_DEF("isEval", 0, js_callsite_return_false),
+    JS_CFUNC_DEF("isConstructor", 0, js_callsite_return_false),
+    JS_CFUNC_DEF("isPromiseAll", 0, js_callsite_return_false),
+    JS_CFUNC_DEF("isAsync", 0, js_callsite_isasync),
+    JS_CFUNC_DEF("isToplevel", 0, js_callsite_istoplevel),
     JS_CFUNC_MAGIC_DEF("getFileName", 0, js_callsite_getfield, offsetof(JSCallSiteData, filename)),
     JS_CFUNC_MAGIC_DEF("getFunction", 0, js_callsite_getfield, offsetof(JSCallSiteData, func)),
     JS_CFUNC_MAGIC_DEF("getFunctionName", 0, js_callsite_getfield, offsetof(JSCallSiteData, func_name)),
     JS_CFUNC_MAGIC_DEF("getColumnNumber", 0, js_callsite_getnumber, offsetof(JSCallSiteData, col_num)),
     JS_CFUNC_MAGIC_DEF("getLineNumber", 0, js_callsite_getnumber, offsetof(JSCallSiteData, line_num)),
+    JS_CFUNC_DEF("getEvalOrigin", 0, js_callsite_return_undefined),
+    JS_CFUNC_DEF("getThis", 0, js_callsite_return_undefined),
+    JS_CFUNC_DEF("getTypeName", 0, js_callsite_return_undefined),
+    JS_CFUNC_DEF("getMethodName", 0, js_callsite_return_undefined),
+    JS_CFUNC_DEF("getScriptNameOrSourceURL", 0, js_callsite_getscriptname),
+    JS_CFUNC_DEF("getPromiseIndex", 0, js_callsite_return_null),
     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "CallSite", JS_PROP_CONFIGURABLE ),
 };
 
