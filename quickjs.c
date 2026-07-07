@@ -336,6 +336,7 @@ struct JSRuntime {
     // for smuggling the parent promise from js_promise_then
     // to js_promise_constructor
     JSValueLink *parent_promise;
+    JSValueLink *weakref_kept_objects;
 
     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
     void *host_promise_rejection_tracker_opaque;
@@ -2181,6 +2182,30 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
     return 0;
 }
 
+static int JS_KeepWeakRefTarget(JSContext *ctx, JSValueConst target)
+{
+    JSRuntime *rt = ctx->rt;
+    JSValueLink *link = js_malloc(ctx, sizeof(*link));
+    if (!link)
+        return -1;
+    link->next = rt->weakref_kept_objects;
+    link->value = js_dup(target);
+    rt->weakref_kept_objects = link;
+    return 0;
+}
+
+static void JS_ClearWeakRefKeptObjects(JSRuntime *rt)
+{
+    JSValueLink *link = rt->weakref_kept_objects;
+    rt->weakref_kept_objects = NULL;
+    while (link) {
+        JSValueLink *next = link->next;
+        JS_FreeValueRT(rt, unsafe_unconst(link->value));
+        js_free_rt(rt, link);
+        link = next;
+    }
+}
+
 bool JS_IsJobPending(JSRuntime *rt)
 {
     return !list_empty(&rt->job_list);
@@ -2221,6 +2246,7 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
         ret = 1;
     JS_FreeValue(ctx, res);
     js_free(ctx, e);
+    JS_ClearWeakRefKeptObjects(rt);
     *pctx = ctx;
     return ret;
 }
@@ -2317,6 +2343,7 @@ void JS_FreeRuntime(JSRuntime *rt)
 
     rt->in_free = true;
     JS_FreeValueRT(rt, rt->current_exception);
+    JS_ClearWeakRefKeptObjects(rt);
 
     list_for_each_safe(el, el1, &rt->job_list) {
         JSJobEntry *e = list_entry(el, JSJobEntry, link);
@@ -7418,6 +7445,8 @@ static void gc_free_cycles(JSRuntime *rt)
 
 void JS_RunGC(JSRuntime *rt)
 {
+    JS_ClearWeakRefKeptObjects(rt);
+
     /* decrement the reference of the children of each object. mark =
        1 after this pass. */
     gc_decref(rt);
@@ -17512,7 +17541,7 @@ static __exception int JS_CopyDataProperties(JSContext *ctx,
 }
 
 /* only valid inside C functions */
-static JSValueConst JS_GetActiveFunction(JSContext *ctx)
+JSValueConst JS_GetActiveFunction(JSContext *ctx)
 {
     return ctx->rt->current_stack_frame->cur_func;
 }
@@ -30312,16 +30341,18 @@ static void js_free_module_def(JSContext *ctx, JSModuleDef *m)
 #ifndef QJS_DISABLE_PARSER
 
 static int add_req_module_entry(JSContext *ctx, JSModuleDef *m,
-                                JSAtom module_name)
+                                JSAtom module_name, int force_new)
 {
     JSReqModuleEntry *rme;
     int i;
 
     /* no need to add the module request if it is already present */
-    for(i = 0; i < m->req_module_entries_count; i++) {
-        rme = &m->req_module_entries[i];
-        if (rme->module_name == module_name)
-            return i;
+    if (!force_new) {
+        for(i = 0; i < m->req_module_entries_count; i++) {
+            rme = &m->req_module_entries[i];
+            if (rme->module_name == module_name && JS_IsUndefined(rme->attributes))
+                return i;
+        }
     }
 
     if (js_resize_array(ctx, (void **)&m->req_module_entries,
@@ -30329,7 +30360,8 @@ static int add_req_module_entry(JSContext *ctx, JSModuleDef *m,
                         &m->req_module_entries_size,
                         m->req_module_entries_count + 1))
         return -1;
-    rme = &m->req_module_entries[m->req_module_entries_count++];
+    i = m->req_module_entries_count++;
+    rme = &m->req_module_entries[i];
     rme->module_name = JS_DupAtom(ctx, module_name);
     rme->module = NULL;
     rme->attributes = JS_UNDEFINED;
@@ -32344,7 +32376,7 @@ static __exception int js_parse_from_clause(JSParseState *s, JSModuleDef *m)
         return -1;
     }
 
-    idx = add_req_module_entry(s->ctx, m, module_name);
+    idx = add_req_module_entry(s->ctx, m, module_name, s->token.val == TOK_WITH);
     JS_FreeAtom(s->ctx, module_name);
     if (idx < 0)
         return -1;
@@ -32614,7 +32646,7 @@ static __exception int js_parse_import(JSParseState *s)
             JS_FreeAtom(ctx, module_name);
             return -1;
         }
-        idx = add_req_module_entry(ctx, m, module_name);
+        idx = add_req_module_entry(ctx, m, module_name, s->token.val == TOK_WITH);
         JS_FreeAtom(ctx, module_name);
         if (idx < 0)
             return -1;
@@ -62292,6 +62324,12 @@ static JSValue js_weakref_constructor(JSContext *ctx, JSValueConst new_target,
         js_free(ctx, wrd);
         return JS_EXCEPTION;
     }
+    if (JS_KeepWeakRefTarget(ctx, arg) < 0) {
+        JS_FreeValue(ctx, obj);
+        js_free(ctx, wrd);
+        js_free(ctx, wr);
+        return JS_EXCEPTION;
+    }
     wrd->target = arg;
     wrd->obj = obj;
     wr->kind = JS_WEAK_REF_KIND_WEAK_REF;
@@ -62337,6 +62375,12 @@ JSValue JS_NewWeakRef(JSContext *ctx, JSValueConst target)
     if (!wr) {
         JS_FreeValue(ctx, obj);
         js_free(ctx, wrd);
+        return JS_EXCEPTION;
+    }
+    if (JS_KeepWeakRefTarget(ctx, target) < 0) {
+        JS_FreeValue(ctx, obj);
+        js_free(ctx, wrd);
+        js_free(ctx, wr);
         return JS_EXCEPTION;
     }
     wrd->target = target;

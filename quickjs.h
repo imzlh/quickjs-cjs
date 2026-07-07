@@ -1428,6 +1428,7 @@ typedef union JSCFunctionType {
 JS_EXTERN JSValue JS_NewCFunction2(JSContext *ctx, JSCFunction *func,
                                    const char *name,
                                    int length, JSCFunctionEnum cproto, int magic);
+JS_EXTERN JSValueConst JS_GetActiveFunction(JSContext *ctx);
 JS_EXTERN JSValue JS_NewCFunction3(JSContext *ctx, JSCFunction *func,
                                    const char *name,
                                    int length, JSCFunctionEnum cproto, int magic,
