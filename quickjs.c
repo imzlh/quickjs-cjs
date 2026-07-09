@@ -844,6 +844,15 @@ typedef struct JSVarDef {
 #define PC2LINE_OP_FIRST 1
 #define PC2LINE_DIFF_PC_MAX ((255 - PC2LINE_OP_FIRST) / PC2LINE_RANGE)
 
+/* One decoded (pc, line, col) state from a pc2line table -- used when
+   remapping the whole table through a sourcemap at bytecode-write time
+   (see decode_pc2line_full / encode_pc2line_from_states). */
+typedef struct PC2LineState {
+    uint32_t pc;
+    int line_num;
+    int col_num;
+} PC2LineState;
+
 typedef enum JSFunctionKindEnum {
     JS_FUNC_NORMAL = 0,
     JS_FUNC_GENERATOR = (1 << 0),
@@ -8464,6 +8473,95 @@ static int find_line_num(JSContext *ctx, JSFunctionBytecode *b,
 fail:
     /* should never happen */
     return b->line_num;
+}
+
+/*
+ * Decode the *entire* pc2line_buf into an array of (pc, line, col) states,
+ * mirroring find_line_num()'s loop but without the pc_value early-exit.
+ * states[0] is always the function's base (pc=0, line_num=b->line_num,
+ * col_num=b->col_num) even if pc2line_buf is empty/absent.
+ *
+ * Returns the array (js_malloc'd, caller frees with js_free) and sets
+ * *pcount >= 1 on success. Returns NULL and sets *pcount = -1 on OOM or a
+ * malformed pc2line table -- both treated as hard failures by the caller,
+ * since a malformed table here indicates a genuine invariant violation
+ * ("should never happen", per find_line_num's own comment above).
+ */
+static PC2LineState *decode_pc2line_full(JSContext *ctx, JSFunctionBytecode *b,
+                                          int *pcount)
+{
+    const uint8_t *p, *p_end;
+    int line_num, col_num, new_line_num, new_col_num, ret, v;
+    uint32_t pc;
+    unsigned int op;
+    PC2LineState *states;
+    int count, cap;
+
+    *pcount = -1;
+
+    /* Upper bound on emitted entries: every encoded entry consumes at
+       least 1 input byte (the op byte), so pc2line_len + 1 (for the
+       guaranteed base entry) is a safe, simple bound -- avoids a
+       two-pass count-then-allocate scheme or realloc doubling. This
+       only runs at bytecode-write (cache) time, not the hot path. */
+    cap = 1 + b->pc2line_len;
+    states = js_malloc(ctx, sizeof(PC2LineState) * cap);
+    if (!states)
+        return NULL;
+
+    count = 0;
+    states[count].pc = 0;
+    states[count].line_num = b->line_num;
+    states[count].col_num = b->col_num;
+    count++;
+
+    p = b->pc2line_buf;
+    if (!p || b->pc2line_len == 0) {
+        *pcount = count; /* just the base -- valid, not an error */
+        return states;
+    }
+    p_end = p + b->pc2line_len;
+    pc = 0;
+    line_num = b->line_num;
+    col_num = b->col_num;
+
+    while (p < p_end) {
+        op = *p++;
+        if (op == 0) {
+            uint32_t val;
+            ret = get_leb128(&val, p, p_end);
+            if (ret < 0) goto fail2;
+            pc += val;
+            p += ret;
+            ret = get_sleb128(&v, p, p_end);
+            if (ret < 0) goto fail2;
+            p += ret;
+            new_line_num = line_num + v;
+        } else {
+            op -= PC2LINE_OP_FIRST;
+            pc += (op / PC2LINE_RANGE);
+            new_line_num = line_num + (op % PC2LINE_RANGE) + PC2LINE_BASE;
+        }
+        ret = get_sleb128(&v, p, p_end);
+        if (ret < 0) goto fail2;
+        p += ret;
+        new_col_num = col_num + v;
+
+        /* count < cap by construction: each iteration consumes >=1 byte
+           from p, and cap == pc2line_len + 1. */
+        states[count].pc = pc;
+        states[count].line_num = new_line_num;
+        states[count].col_num = new_col_num;
+        count++;
+
+        line_num = new_line_num;
+        col_num = new_col_num;
+    }
+    *pcount = count;
+    return states;
+fail2:
+    js_free(ctx, states);
+    return NULL;
 }
 
 /* in order to avoid executing arbitrary code during the stack trace
@@ -35902,6 +36000,54 @@ static void compute_pc2line_info(JSFunctionDef *s)
     }
 }
 
+/*
+ * Re-encode states[1..count-1] as a pc2line table relative to states[0]
+ * (the function's remapped base), using the exact same compact/escape
+ * format as compute_pc2line_info() above so the unmodified find_line_num()/
+ * JS_ReadFunctionTag() can read it back. Mirrors that function's
+ * "skip if diff_line==0 && diff_col==0" compaction, so states that
+ * collapsed onto the same original-source position after remapping are
+ * coalesced away exactly as the original encoder would have done.
+ */
+static void encode_pc2line_from_states(DynBuf *out, PC2LineState *states, int count)
+{
+    int last_line_num = states[0].line_num;
+    int last_col_num = states[0].col_num;
+    uint32_t last_pc = 0;
+    int i;
+
+    for (i = 1; i < count; i++) {
+        uint32_t pc = states[i].pc;
+        int line_num = states[i].line_num;
+        int col_num = states[i].col_num;
+        int diff_pc = pc - last_pc;
+        int diff_line = line_num - last_line_num;
+        int diff_col = col_num - last_col_num;
+
+        if (diff_pc < 0)
+            continue;
+        if (diff_line == 0 && diff_col == 0)
+            continue;
+
+        if (diff_line >= PC2LINE_BASE &&
+            diff_line < PC2LINE_BASE + PC2LINE_RANGE &&
+            diff_pc <= PC2LINE_DIFF_PC_MAX) {
+            dbuf_putc(out, (diff_line - PC2LINE_BASE) +
+                      diff_pc * PC2LINE_RANGE + PC2LINE_OP_FIRST);
+        } else {
+            dbuf_putc(out, 0);
+            dbuf_put_leb128(out, diff_pc);
+            dbuf_put_sleb128(out, diff_line);
+        }
+        dbuf_put_sleb128(out, diff_col);
+
+        last_pc = pc;
+        last_line_num = line_num;
+        last_col_num = col_num;
+    }
+}
+
+
 static RelocEntry *add_reloc(JSContext *ctx, LabelSlot *ls, uint32_t addr, int size)
 {
     RelocEntry *re;
@@ -39186,16 +39332,62 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
         goto fail;
 
     if (s->allow_debug) {
-        int line = b->line_num, col = b->col_num;
-		if (s->ctx->rt->backtrace_hook) {
-			const char* filename = JS_AtomToCString(s->ctx, b->filename);
-			s->ctx->rt->backtrace_hook(s->ctx, filename, &line, &col);
-		}
+        int out_line = b->line_num, out_col = b->col_num;
+        const uint8_t *pc2line_out = b->pc2line_buf;
+        int pc2line_out_len = b->pc2line_len;
+        uint8_t *remapped_buf = NULL;
+
+        if (s->ctx->rt->backtrace_hook) {
+            int count;
+            PC2LineState *states = decode_pc2line_full(s->ctx, b, &count);
+            if (!states) {
+                JS_ThrowOutOfMemory(s->ctx);
+                goto fail;
+            }
+
+            const char *filename_cstr = JS_AtomToCString(s->ctx, b->filename);
+            if (!filename_cstr) {
+                js_free(s->ctx, states);
+                goto fail;
+            }
+
+            bool all_mapped = true;
+            for (int i = 0; i < count; i++) {
+                int rl = states[i].line_num, rc = states[i].col_num;
+                if (!s->ctx->rt->backtrace_hook(s->ctx, filename_cstr, &rl, &rc)) {
+                    all_mapped = false;
+                    break;
+                }
+                states[i].line_num = rl;
+                states[i].col_num = rc;
+            }
+            JS_FreeCString(s->ctx, filename_cstr);
+
+            if (all_mapped) {
+                DynBuf new_pc2line;
+                js_dbuf_init(s->ctx, &new_pc2line);
+                encode_pc2line_from_states(&new_pc2line, states, count);
+                if (dbuf_error(&new_pc2line)) {
+                    dbuf_free(&new_pc2line);
+                    js_free(s->ctx, states);
+                    JS_ThrowOutOfMemory(s->ctx);
+                    goto fail;
+                }
+                out_line = states[0].line_num;
+                out_col = states[0].col_num;
+                remapped_buf = new_pc2line.buf;
+                pc2line_out = remapped_buf;
+                pc2line_out_len = new_pc2line.size;
+            }
+            js_free(s->ctx, states);
+        }
+
         bc_put_atom(s, b->filename);
-        bc_put_leb128(s, line);
-        bc_put_leb128(s, col);
-        bc_put_leb128(s, b->pc2line_len);
-        dbuf_put(&s->dbuf, b->pc2line_buf, b->pc2line_len);
+        bc_put_leb128(s, out_line);
+        bc_put_leb128(s, out_col);
+        bc_put_leb128(s, pc2line_out_len);
+        dbuf_put(&s->dbuf, pc2line_out, pc2line_out_len);
+        js_free(s->ctx, remapped_buf);
         if (s->allow_source && b->source) {
             bc_put_leb128(s, b->source_len);
             dbuf_put(&s->dbuf, b->source, b->source_len);
