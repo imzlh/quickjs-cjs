@@ -1487,6 +1487,7 @@ static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv, int magic);
 static JSValue js_promise_then(JSContext *ctx, JSValueConst this_val,
                                int argc, JSValueConst *argv);
+static void js_promise_mark_handled(JSContext *ctx, JSValueConst promise);
 static JSValue js_promise_resolve_thenable_job(JSContext *ctx,
                                                int argc, JSValueConst *argv);
 static bool js_string_eq(JSString *p1, JSString *p2);
@@ -8680,8 +8681,15 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
         saved_exception = JS_GetException(ctx);
         if (stack_trace_limit == 0)
             goto done;
-        if (filename)
+        if (filename) {
+            /* Mirror the string branch below, which maps this same
+               parse-error position through rt->backtrace_hook. Without it
+               Error.prepareStackTrace reports the generated position while
+               error.stack reports the mapped original one. */
+            if (rt->backtrace_hook)
+                rt->backtrace_hook(ctx, filename, &line_num, &col_num);
             js_new_callsite_data2(ctx, &csd[i++], filename, line_num, col_num);
+        }
     } else {
         js_dbuf_init(ctx, &dbuf);
         if (stack_trace_limit == 0)
@@ -8730,6 +8738,41 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
 
         if (has_prepare) {
             js_new_callsite_data(ctx, &csd[i], sf);
+            /* Map the frame through rt->backtrace_hook exactly as the string
+               branch below does. Without this, Error.prepareStackTrace gets
+               generated post-transform positions while error.stack gets mapped
+               original ones, so one error reports two different places
+               depending on which API is read. Every callsite-consuming library
+               (source-map-support, sentry, ts-node) reads the getters.
+
+               Cost is symmetric with the string branch, not additional: one
+               JS_AtomToCString plus one hook call per frame, in this same loop,
+               bounded by stack_trace_limit. It cannot be deferred to the
+               CallSite getters even though user code consumes them lazily,
+               because js_new_callsite() memcpy's csd into the heap object and
+               neither b nor its filename atom is retained past this loop.
+
+               csd[i].filename is deliberately left as the generated name: the
+               hook has no out-parameter for it and the string branch prints
+               the generated name too, so both branches stay consistent.
+
+               cs_file is freed only AFTER the hook returns, because the cno
+               hook dereferences it via find_file_map(). Freeing first was a
+               use-after-free that had to be fixed in the string branch. */
+            if (rt->backtrace_hook && b && b->filename &&
+                csd[i].line_num != -1) {
+                const char *cs_file = JS_AtomToCString(ctx, b->filename);
+                if (cs_file) {
+                    rt->backtrace_hook(ctx, cs_file, &csd[i].line_num,
+                                       &csd[i].col_num);
+                    JS_FreeCString(ctx, cs_file);
+                } else {
+                    /* Keep the no-exception contract: the current exception
+                       slot was emptied into saved_exception above, and
+                       done: re-throws that. */
+                    JS_FreeValue(ctx, JS_GetException(ctx));
+                }
+            }
         } else {
             /* func_name_str is UTF-8 encoded if needed */
             func_name_str = get_func_name(ctx, sf->cur_func);
@@ -8749,12 +8792,16 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
                 line_num1 = find_line_num(ctx, b, pc, &col_num1);
                 atom_str = b->filename ? JS_AtomToCString(ctx, b->filename) : NULL;
                 dbuf_printf(&dbuf, " (%s", atom_str ? atom_str : "<null>");
-                JS_FreeCString(ctx, atom_str);
                 if (line_num1 != -1){
 					if (rt->backtrace_hook)
 						rt->backtrace_hook(ctx, atom_str, &line_num1, &col_num1);
                     dbuf_printf(&dbuf, ":%d:%d", line_num1, col_num1);
 				}
+                /* Freed AFTER backtrace_hook, not before: the hook receives
+                   atom_str as its file path and dereferences it (the cno hook
+                   passes it to find_file_map()), so freeing it above was a
+                   use-after-free on every sourcemapped frame. */
+                JS_FreeCString(ctx, atom_str);
                 dbuf_putc(&dbuf, ')');
             } else if (b) {
                 // FIXME(bnoordhuis) Missing `sf->cur_pc = pc` in bytecode
@@ -12467,7 +12514,41 @@ bool JS_IsFunction(JSContext *ctx, JSValueConst val)
 
 bool JS_IsAsyncFunction(JSValueConst val)
 {
-    return JS_CLASS_ASYNC_FUNCTION == JS_GetClassID(val);
+    JSClassID class_id = JS_GetClassID(val);
+    return class_id == JS_CLASS_ASYNC_FUNCTION || class_id == JS_CLASS_ASYNC_GENERATOR_FUNCTION;
+}
+
+bool JS_IsArgumentsObject(JSValueConst val)
+{
+    JSClassID class_id = JS_GetClassID(val);
+    return class_id == JS_CLASS_ARGUMENTS || class_id == JS_CLASS_MAPPED_ARGUMENTS;
+}
+
+bool JS_IsGeneratorFunction(JSValueConst val)
+{
+    JSClassID class_id = JS_GetClassID(val);
+    return class_id == JS_CLASS_GENERATOR_FUNCTION || class_id == JS_CLASS_ASYNC_GENERATOR_FUNCTION;
+}
+
+bool JS_IsGeneratorObject(JSValueConst val)
+{
+    JSClassID class_id = JS_GetClassID(val);
+    return class_id == JS_CLASS_GENERATOR || class_id == JS_CLASS_ASYNC_GENERATOR;
+}
+
+bool JS_IsMapIterator(JSValueConst val)
+{
+    return JS_CLASS_MAP_ITERATOR == JS_GetClassID(val);
+}
+
+bool JS_IsSetIterator(JSValueConst val)
+{
+    return JS_CLASS_SET_ITERATOR == JS_GetClassID(val);
+}
+
+bool JS_IsModuleNamespaceObject(JSValueConst val)
+{
+    return JS_CLASS_MODULE_NS == JS_GetClassID(val);
 }
 
 static bool JS_IsCFunction(JSContext *ctx, JSValueConst val, JSCFunction *func,
@@ -27614,6 +27695,14 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
     FuncCallType call_type;
     int optional_chaining_label;
     bool accept_lparen = (parse_flags & PF_POSTFIX_CALL) != 0;
+    /* Source position of the `new` keyword for the construct parsed by THIS
+     * invocation. V8 anchors a `new X()` stack frame at `new`, not at the
+     * constructor identifier, and QuickJS was reporting the identifier.
+     * Function scope is required because the two OP_call_constructor emit
+     * sites below are in different blocks. Recursion is safe without a
+     * save/restore stack: every recursive js_parse_postfix_expr call gets a
+     * fresh frame, so a nested `new` in an argument list has its own copy. */
+    int new_kw_line = -1, new_kw_col = -1;
 
     call_type = FUNC_CALL_NORMAL;
     switch(s->token.val) {
@@ -27798,6 +27887,9 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
         }
         break;
     case TOK_NEW:
+        /* Capture before next_token() advances past `new`. */
+        new_kw_line = s->token.line_num;
+        new_kw_col  = s->token.col_num;
         if (next_token(s))
             return -1;
         if (s->token.val == '.') {
@@ -27813,12 +27905,16 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
             emit_atom(s, JS_ATOM_new_target);
             emit_u16(s, 0);
         } else {
-            emit_source_loc(s);
+            emit_source_loc_at(s, new_kw_line, new_kw_col);
             if (js_parse_postfix_expr(s, 0))
                 return -1;
             accept_lparen = true;
             if (s->token.val != '(') {
                 /* new operator on an object */
+                /* Re-assert: the operand parse can emit its own source loc.
+                 * The computed-member branch does exactly that, so `new a[b]`
+                 * would otherwise stay anchored on the operand. */
+                emit_source_loc_at(s, new_kw_line, new_kw_col);
                 emit_op(s, OP_dup);
                 emit_op(s, OP_call_constructor);
                 emit_u16(s, 0);
@@ -28171,6 +28267,22 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
 
                         emit_class_field_init(s);
                     } else if (call_type == FUNC_CALL_NEW) {
+                        /* Re-assert immediately before the instruction whose
+                         * position the backtrace reports.
+                         *
+                         * Do NOT simplify this back to a single assignment in
+                         * the TOK_NEW case above. That is provably not enough:
+                         * between there and here, js_parse_argument_list runs
+                         * js_parse_assign_expr once per argument, and ordinary
+                         * arguments emit their own source locations. Two common
+                         * shapes overwrite the position and leave the frame
+                         * anchored on the argument instead of on `new`:
+                         *   new Foo(bar[i])     computed member emits a loc
+                         *   new Foo(new Bar())  nested new emits its own loc
+                         * A one-site fix only holds when neither the callee nor
+                         * any argument emits, which is the rare case. */
+                        if (new_kw_line >= 0)
+                            emit_source_loc_at(s, new_kw_line, new_kw_col);
                         emit_op(s, OP_call_constructor);
                         emit_u16(s, arg_count);
                     } else {
@@ -32651,6 +32763,15 @@ static int js_execute_sync_module(JSContext *ctx, JSModuleDef *m,
             JS_FreeValue(ctx, promise);
         } else if (state == JS_PROMISE_REJECTED) {
             *pvalue = JS_PromiseResult(ctx, promise);
+            /* The rejection propagates synchronously as this module's evaluation
+               exception and is re-raised on the module's own promise, so it IS
+               handled. Without marking it, the host tracker has already reported
+               a promise that is freed on the next line and can therefore never
+               acquire a handler - a caught "await import()" of a throwing module
+               printed a spurious "unhandled promise rejection". The async sibling
+               js_execute_async_module never trips this because js_promise_then
+               marks its promise handled. */
+            js_promise_mark_handled(ctx, promise);
             JS_FreeValue(ctx, promise);
             return -1;
         } else {
@@ -56195,6 +56316,28 @@ bool JS_PromiseIsHandled(JSContext *ctx, JSValueConst promise) {
     return s && s->is_handled;
 }
 
+/* Mark a rejected promise handled without attaching a reaction.
+   Mirrors the bookkeeping perform_promise_then() does at :56666-56683: notify the
+   host that a rejection it already reported is handled after all, then set the
+   flag. Needed where C consumes a rejection and re-raises it elsewhere, so the
+   promise is genuinely handled but never acquires a JS reaction.
+   NOTE: the "only useful to debug" note on JSPromiseData.is_handled is stale in
+   this fork - the flag gates the tracker at :55867 and :56666. */
+static void js_promise_mark_handled(JSContext *ctx, JSValueConst promise)
+{
+    JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
+    if (!s || s->is_handled)
+        return;
+    if (s->promise_state == JS_PROMISE_REJECTED) {
+        JSRuntime *rt = ctx->rt;
+        if (rt->host_promise_rejection_tracker)
+            rt->host_promise_rejection_tracker(ctx, promise, s->promise_result,
+                                               true,
+                                               rt->host_promise_rejection_tracker_opaque);
+    }
+    s->is_handled = true;
+}
+
 static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv, int magic)
 {
@@ -60027,8 +60170,14 @@ JSValue JS_GetTypedArrayBuffer(JSContext *ctx, JSValueConst obj,
     ta = p->u.typed_array;
     if (pbyte_offset)
         *pbyte_offset = ta->offset;
-    if (pbyte_length)
-        *pbyte_length = ta->length;
+    if (pbyte_length) {
+        /* Same stale-length defect as JS_GetUint8Array below: a length-tracking
+           view's live length is p->u.array.count. Unlike that function this one
+           serves every element type, so scale by the element size. */
+        *pbyte_length = ta->track_rab
+            ? (size_t) p->u.array.count << typed_array_size_log2(p->class_id)
+            : ta->length;
+    }
     if (pbytes_per_element) {
         *pbytes_per_element = 1 << typed_array_size_log2(p->class_id);
     }
@@ -60056,7 +60205,15 @@ uint8_t *JS_GetUint8Array(JSContext *ctx, size_t *psize, JSValueConst obj)
     ta = p->u.typed_array;
     abuf = ta->buffer->u.array_buffer;
 
-    *psize = ta->length;
+    /* A length-tracking view over a resizable ArrayBuffer has its LIVE length in
+       p->u.array.count; ta->length is the construction-time value. Returning the
+       stale one produced an out-of-bounds read of reclaimed heap reachable from
+       pure JS: after shrinking a 4096-byte RAB to 8 bytes, indexOf found bytes
+       from other allocations at offset 96, and Buffer.concat copied 16 bytes out
+       of a 4-byte view. typed_array_is_oob() cannot catch it — it returns false
+       early for track_rab views, before its length comparison. Uint8Array has an
+       element size of 1, so count needs no shift here. */
+    *psize = ta->track_rab ? p->u.array.count : ta->length;
     return abuf->data + ta->offset;
  fail:
     *psize = 0;

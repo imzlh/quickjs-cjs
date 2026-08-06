@@ -1081,6 +1081,12 @@ JS_EXTERN JSValue JS_ToObjectString(JSContext *ctx, JSValueConst val);
 
 JS_EXTERN bool JS_IsFunction(JSContext* ctx, JSValueConst val);
 JS_EXTERN bool JS_IsAsyncFunction(JSValueConst val);
+JS_EXTERN bool JS_IsArgumentsObject(JSValueConst val);
+JS_EXTERN bool JS_IsGeneratorFunction(JSValueConst val);
+JS_EXTERN bool JS_IsGeneratorObject(JSValueConst val);
+JS_EXTERN bool JS_IsMapIterator(JSValueConst val);
+JS_EXTERN bool JS_IsSetIterator(JSValueConst val);
+JS_EXTERN bool JS_IsModuleNamespaceObject(JSValueConst val);
 JS_EXTERN bool JS_IsConstructor(JSContext* ctx, JSValueConst val);
 JS_EXTERN bool JS_SetConstructorBit(JSContext *ctx, JSValueConst func_obj, bool val);
 
