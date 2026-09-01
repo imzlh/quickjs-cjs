@@ -63035,6 +63035,31 @@ static JSValue js_dataview_get_byteOffset(JSContext *ctx, JSValueConst this_val)
     return js_uint32(ta->offset);
 }
 
+JSValue JS_GetDataViewBuffer(JSContext *ctx, JSValueConst obj,
+                             size_t *pbyte_offset, size_t *pbyte_length)
+{
+    JSObject *p;
+    JSTypedArray *ta;
+    JSArrayBuffer *abuf;
+
+    p = get_dataview(ctx, obj);
+    if (!p)
+        return JS_EXCEPTION;
+    if (dataview_is_oob(p))
+        return JS_ThrowTypeErrorArrayBufferOOB(ctx);
+
+    ta = p->u.typed_array;
+    abuf = ta->buffer->u.array_buffer;
+    if (pbyte_offset)
+        *pbyte_offset = ta->offset;
+    if (pbyte_length) {
+        *pbyte_length = ta->track_rab
+            ? abuf->byte_length - ta->offset
+            : ta->length;
+    }
+    return js_dup(JS_MKPTR(JS_TAG_OBJECT, ta->buffer));
+}
+
 static JSValue js_dataview_getValue(JSContext *ctx,
                                     JSValueConst this_obj,
                                     int argc, JSValueConst *argv, int class_id)

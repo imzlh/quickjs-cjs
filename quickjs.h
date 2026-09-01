@@ -1265,6 +1265,12 @@ JS_EXTERN JSValue JS_GetTypedArrayBuffer(JSContext *ctx, JSValueConst obj,
                                          size_t *pbyte_offset,
                                          size_t *pbyte_length,
                                          size_t *pbytes_per_element);
+/* Return the buffer associated with a DataView without invoking its public
+   accessors. Returns an exception for non-DataView or detached/out-of-bounds
+   inputs. pbyte_offset and pbyte_length may be NULL. */
+JS_EXTERN JSValue JS_GetDataViewBuffer(JSContext *ctx, JSValueConst obj,
+                                       size_t *pbyte_offset,
+                                       size_t *pbyte_length);
 JS_EXTERN JSValue JS_NewUint8Array(JSContext *ctx, uint8_t *buf, size_t len,
                                    JSReallocArrayBufferDataFunc *realloc_func,
                                    void *opaque, bool is_shared);
