@@ -1085,8 +1085,14 @@ static void large_allocation_accounting(void)
     JS_ComputeMemoryUsage(rt, &before);
     JS_SetMemoryLimit(rt, (size_t)before.malloc_size + 4 * block_size);
     ret = eval(ctx, "globalThis.a = [];\n"
-                    "for (let i = 0; i < 64; i++)\n"
-                    "    a.push(new Uint8Array(1024 * 1024));");
+                    "for (let i = 0; i < 64; i++) {\n"
+                    "    // OOM exception should be uncatchable\n"
+                    "    try {\n"
+                    "        a.push(new Uint8Array(1024 * 1024));"
+                    "    } catch (e) {\n"
+                    "        throw 'unexpected exception';\n"
+                    "    }\n"
+                    "}");
     assert(JS_IsException(ret));
     JS_SetMemoryLimit(rt, 0);
     JS_ComputeMemoryUsage(rt, &after);
@@ -2366,6 +2372,45 @@ static void new_context_low_memory(void)
     assert(ok < all);   // ...but not all
 }
 
+// running out of memory in JSON.stringify must not leak the array element
+// that was being converted
+static void json_stringify_oom(void)
+{
+    static const char setup_code[] =
+        "globalThis.f = () => JSON.stringify([{}]);\n"
+        "f();\n"; // JSON.stringify is set up on first access, do it now
+    JSValue global_object, func, ret;
+    JSMemoryUsage stats;
+    uint32_t headroom;
+    JSRuntime *rt;
+    JSContext *ctx;
+
+    rt = new_runtime();
+    ctx = JS_NewContext(rt);
+    global_object = JS_GetGlobalObject(ctx);
+
+    ret = eval(ctx, setup_code);
+    assert(!JS_IsException(ret));
+    JS_FreeValue(ctx, ret);
+
+    func = JS_GetPropertyStr(ctx, global_object, "f");
+    assert(JS_IsFunction(ctx, func));
+
+    for (headroom = 0; headroom < 2048; headroom++) {
+        JS_ComputeMemoryUsage(rt, &stats);
+        JS_SetMemoryLimit(rt, (size_t)stats.malloc_size + headroom);
+        ret = JS_Call(ctx, func, JS_UNDEFINED, 0, NULL);
+        JS_SetMemoryLimit(rt, 0);
+        JS_FreeValue(ctx, ret);
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+
+    JS_FreeValue(ctx, func);
+    JS_FreeValue(ctx, global_object);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 int main(void)
 {
     cfunctions();
@@ -2409,5 +2454,6 @@ int main(void)
     std_eval_interrupt_handler();
     private_symbols();
     new_context_low_memory();
+    json_stringify_oom();
     return 0;
 }
