@@ -981,6 +981,160 @@ typedef struct JSArrayBuffer {
     JSReallocArrayBufferDataFunc *realloc_func;
 } JSArrayBuffer;
 
+/* Ordinary ArrayBuffer storage is deliberately outside the runtime arena.
+   Its system allocation can outlive the source runtime while a transfer is in
+   flight. Exactly one runtime is charged for it whenever a JS ArrayBuffer owns
+   the store; the wire state between runtimes is deliberately uncharged. */
+typedef struct JSAutoBackingStore {
+#ifdef CONFIG_ATOMICS
+    _Atomic int refs;
+#else
+    int refs;
+#endif
+    uint8_t *data;
+    size_t size;
+    size_t charge_size;
+    JSRuntime *charged_rt;
+} JSAutoBackingStore;
+
+enum {
+    JS_AUTO_TRANSFER_EMPTY,
+    JS_AUTO_TRANSFER_PREPARED,
+    JS_AUTO_TRANSFER_COMMITTED,
+};
+
+static size_t js_auto_backing_charge_size(size_t size)
+{
+    size_t alloc_size = max_int(size, 1);
+
+    if (alloc_size > SIZE_MAX - sizeof(JSAutoBackingStore) -
+                     2 * MALLOC_OVERHEAD)
+        return SIZE_MAX;
+    return sizeof(JSAutoBackingStore) + alloc_size + 2 * MALLOC_OVERHEAD;
+}
+
+static int js_auto_backing_charge(JSRuntime *rt, JSAutoBackingStore *store)
+{
+    JSMallocState *s = &rt->malloc_state;
+    size_t limit = s->malloc_limit ? s->malloc_limit - 1 : SIZE_MAX;
+    size_t charge = js_auto_backing_charge_size(store->size);
+
+    if (store->charged_rt || charge == SIZE_MAX ||
+        s->malloc_size > limit || charge > limit - s->malloc_size)
+        return -1;
+    s->malloc_count += 2;
+    s->malloc_size += charge;
+    store->charge_size = charge;
+    store->charged_rt = rt;
+    return 0;
+}
+
+static void js_auto_backing_uncharge(JSRuntime *rt,
+                                     JSAutoBackingStore *store)
+{
+    JSMallocState *s;
+
+    if (!store || !store->charged_rt)
+        return;
+    assert(store->charged_rt == rt);
+    s = &rt->malloc_state;
+    assert(s->malloc_count >= 2);
+    assert(s->malloc_size >= store->charge_size);
+    s->malloc_count -= 2;
+    s->malloc_size -= store->charge_size;
+    store->charge_size = 0;
+    store->charged_rt = NULL;
+}
+
+static void js_auto_backing_dup(JSAutoBackingStore *store)
+{
+    if (store) {
+#ifdef CONFIG_ATOMICS
+        atomic_fetch_add(&store->refs, 1);
+#else
+        store->refs++;
+#endif
+    }
+}
+
+static void js_auto_backing_release(JSAutoBackingStore *store)
+{
+    if (store) {
+        int refs;
+#ifdef CONFIG_ATOMICS
+        refs = atomic_fetch_sub(&store->refs, 1) - 1;
+#else
+        refs = --store->refs;
+#endif
+        if (refs == 0) {
+            assert(store->charged_rt == NULL);
+            free(store->data);
+            free(store);
+        }
+    }
+}
+
+static JSAutoBackingStore *js_auto_backing_new(JSRuntime *rt, size_t size)
+{
+    JSAutoBackingStore *store = malloc(sizeof(*store));
+    if (!store)
+        return NULL;
+    memset(store, 0, sizeof(*store));
+    store->data = calloc(1, max_int(size, 1));
+    if (!store->data) {
+        free(store);
+        return NULL;
+    }
+    store->refs = 1;
+    store->size = size;
+    if (js_auto_backing_charge(rt, store)) {
+        free(store->data);
+        free(store);
+        return NULL;
+    }
+    return store;
+}
+
+static void *js_auto_backing_realloc(JSRuntime *rt, void *opaque, void *ptr,
+                                     size_t size)
+{
+    JSAutoBackingStore *store = opaque;
+    uint8_t *data;
+    size_t old_charge, new_charge, limit;
+    JSMallocState *s;
+
+    if (!store || ptr != store->data)
+        return NULL;
+    if (size == 0) {
+        js_auto_backing_uncharge(rt, store);
+        js_auto_backing_release(store);
+        return NULL;
+    }
+    if (store->charged_rt != rt)
+        return NULL;
+    old_charge = store->charge_size;
+    new_charge = js_auto_backing_charge_size(size);
+    if (new_charge == SIZE_MAX)
+        return NULL;
+    s = &rt->malloc_state;
+    limit = s->malloc_limit ? s->malloc_limit - 1 : SIZE_MAX;
+    if (new_charge > old_charge &&
+        (s->malloc_size > limit ||
+         new_charge - old_charge > limit - s->malloc_size))
+        return NULL;
+    data = realloc(store->data, max_int(size, 1));
+    if (!data)
+        return NULL;
+    store->data = data;
+    store->size = size;
+    if (new_charge >= old_charge)
+        s->malloc_size += new_charge - old_charge;
+    else
+        s->malloc_size -= old_charge - new_charge;
+    store->charge_size = new_charge;
+    return data;
+}
+
 typedef struct JSTypedArray {
     struct list_head link; /* link to arraybuffer */
     JSObject *obj; /* back pointer to the TypedArray/DataView object */
@@ -39448,6 +39602,8 @@ typedef enum BCTagEnum {
     BC_TAG_MAP,
     BC_TAG_SET,
     BC_TAG_SYMBOL,
+    /* Structured-clone-only tag: payload is a transfer-table index. */
+    BC_TAG_ARRAY_BUFFER_TRANSFER,
 } BCTagEnum;
 
 #define BC_VERSION 29
@@ -39460,6 +39616,8 @@ typedef struct BCWriterState {
     bool allow_reference;
     bool allow_source;
     bool allow_debug;
+    bool allow_transfer;
+    JSAutoTransferTab *transfer_tab;
     uint32_t first_atom;
     uint32_t *atom_to_idx;
     int atom_to_idx_size;
@@ -39499,6 +39657,7 @@ static const char * const bc_tag_str[] = {
     "Map",
     "Set",
     "Symbol",
+    "ArrayBufferTransfer",
 };
 
 static const char *bc_tag_name(uint8_t tag)
@@ -40034,6 +40193,26 @@ static int JS_WriteArrayBuffer(BCWriterState *s, JSValueConst obj)
     return 0;
 }
 
+static int JS_WriteArrayBufferTransfer(BCWriterState *s, uint32_t index)
+{
+    bc_put_u8(s, BC_TAG_ARRAY_BUFFER_TRANSFER);
+    bc_put_leb128(s, index);
+    return 0;
+}
+
+static int JS_FindTransfer(BCWriterState *s, JSValueConst obj)
+{
+    size_t i;
+    if (!s->allow_transfer || !s->transfer_tab)
+        return -1;
+    for (i = 0; i < s->transfer_tab->len; i++) {
+        if (JS_VALUE_GET_OBJ(s->transfer_tab->tab[i].value) ==
+            JS_VALUE_GET_OBJ(obj))
+            return (int)i;
+    }
+    return -1;
+}
+
 static int JS_WriteSharedArrayBuffer(BCWriterState *s, JSValueConst obj)
 {
     JSObject *p = JS_VALUE_GET_OBJ(obj);
@@ -40157,7 +40336,15 @@ static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj)
                 ret = JS_WriteObjectTag(s, obj);
                 break;
             case JS_CLASS_ARRAY_BUFFER:
-                ret = JS_WriteArrayBuffer(s, obj);
+                if (s->allow_transfer) {
+                    int transfer_index = JS_FindTransfer(s, obj);
+                    if (transfer_index >= 0)
+                        ret = JS_WriteArrayBufferTransfer(s, transfer_index);
+                    else
+                        ret = JS_WriteArrayBuffer(s, obj);
+                } else {
+                    ret = JS_WriteArrayBuffer(s, obj);
+                }
                 break;
             case JS_CLASS_SHARED_ARRAY_BUFFER:
                 if (!s->allow_sab)
@@ -40208,6 +40395,10 @@ static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj)
         break;
     case JS_TAG_SYMBOL:
         {
+            if (s->allow_transfer) {
+                JS_ThrowTypeError(s->ctx, "symbols are not supported in structured clone");
+                goto fail;
+            }
             JSAtomStruct *p = JS_VALUE_GET_PTR(obj);
             if (p->atom_type != JS_ATOM_TYPE_GLOBAL_SYMBOL && p->atom_type != JS_ATOM_TYPE_SYMBOL) {
                 JS_ThrowTypeError(s->ctx, "unsupported symbol type");
@@ -40278,12 +40469,120 @@ static int JS_WriteObjectAtoms(BCWriterState *s)
     return -1;
 }
 
-uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
-                         int flags, JSSABTab *psab_tab)
+static int JS_PrepareAutoTransfers(JSContext *ctx, JSAutoTransferTab *tab)
+{
+    size_t i, j;
+    if (!tab)
+        return 0;
+    if (tab->state != JS_AUTO_TRANSFER_EMPTY) {
+        JS_ThrowTypeError(ctx, "ArrayBuffer transfer table is already prepared");
+        return -1;
+    }
+    if (tab->len > UINT32_MAX || (tab->len != 0 && !tab->tab)) {
+        JS_ThrowRangeError(ctx, "invalid ArrayBuffer transfer table");
+        return -1;
+    }
+    /* Validate the entire list before retaining anything or serializing. */
+    for (i = 0; i < tab->len; i++) {
+        JSArrayBuffer *abuf;
+        if (!JS_IsArrayBuffer(tab->tab[i].value)) {
+            JS_ThrowTypeError(ctx, "transfer list entry is not an ArrayBuffer");
+            return -1;
+        }
+        abuf = JS_GetOpaque(tab->tab[i].value, JS_CLASS_ARRAY_BUFFER);
+        if (!abuf || abuf->detached || abuf->max_byte_length >= 0 ||
+            !abuf->data || !abuf->opaque ||
+            abuf->realloc_func != js_auto_backing_realloc) {
+            JS_ThrowTypeError(ctx, "only fixed internal ArrayBuffers can be transferred");
+            return -1;
+        }
+        for (j = 0; j < i; j++) {
+            if (JS_VALUE_GET_OBJ(tab->tab[j].value) ==
+                JS_VALUE_GET_OBJ(tab->tab[i].value)) {
+                JS_ThrowTypeError(ctx, "duplicate ArrayBuffer in transfer list");
+                return -1;
+            }
+        }
+    }
+    for (i = 0; i < tab->len; i++) {
+        JSArrayBuffer *abuf = JS_GetOpaque(tab->tab[i].value,
+                                           JS_CLASS_ARRAY_BUFFER);
+        tab->tab[i].data = abuf->data;
+        tab->tab[i].byte_length = abuf->byte_length;
+        tab->tab[i].max_byte_length = 0;
+        tab->tab[i].opaque = abuf->opaque;
+        tab->tab[i].consumed = 0;
+        js_auto_backing_dup(tab->tab[i].opaque);
+    }
+    tab->state = JS_AUTO_TRANSFER_PREPARED;
+    return 0;
+}
+
+void JS_ReleaseAutoTransferTab(JSAutoTransferTab *tab)
+{
+    size_t i;
+
+    if (!tab)
+        return;
+    for (i = 0; i < tab->len; i++) {
+        JSAutoTransferEntry *entry = &tab->tab[i];
+        if (entry->opaque && !entry->consumed)
+            js_auto_backing_release(entry->opaque);
+        entry->data = NULL;
+        entry->byte_length = 0;
+        entry->max_byte_length = 0;
+        entry->opaque = NULL;
+        entry->consumed = 0;
+    }
+    tab->state = JS_AUTO_TRANSFER_EMPTY;
+}
+
+int JS_CommitArrayBufferTransfers(JSContext *ctx, JSAutoTransferTab *tab)
+{
+    size_t i;
+
+    if (!tab)
+        return 0;
+    if (tab->state != JS_AUTO_TRANSFER_PREPARED) {
+        JS_ThrowTypeError(ctx, "ArrayBuffer transfer table is not prepared");
+        return -1;
+    }
+    /* Commit is atomic: no source is detached until every entry still
+       references the exact backing store prepared by JS_WriteObject3(). */
+    for (i = 0; i < tab->len; i++) {
+        JSAutoTransferEntry *entry = &tab->tab[i];
+        JSArrayBuffer *abuf;
+        if (!JS_IsArrayBuffer(entry->value)) {
+            JS_ThrowTypeError(ctx, "invalid ArrayBuffer transfer entry");
+            return -1;
+        }
+        abuf = JS_GetOpaque(entry->value, JS_CLASS_ARRAY_BUFFER);
+        if (!abuf || abuf->detached || abuf->data != entry->data ||
+            abuf->byte_length != entry->byte_length ||
+            abuf->opaque != entry->opaque ||
+            abuf->realloc_func != js_auto_backing_realloc) {
+            JS_ThrowTypeError(ctx, "ArrayBuffer changed before transfer commit");
+            return -1;
+        }
+    }
+    for (i = 0; i < tab->len; i++) {
+        /* Prepare retained the wire reference. Detaching releases only the
+           source reference, leaving the backing alive for the receiver. */
+        JS_DetachArrayBuffer(ctx, tab->tab[i].value);
+    }
+    tab->state = JS_AUTO_TRANSFER_COMMITTED;
+    return 0;
+}
+
+static uint8_t *JS_WriteObjectInternal(JSContext *ctx, size_t *psize,
+                                       JSValueConst obj, int flags,
+                                       JSSABTab *psab_tab,
+                                       JSAutoTransferTab *transfer_tab)
 {
     BCWriterState ss, *s = &ss;
     uint32_t h;
     DynBuf *d;
+    bool transfers_prepared = false;
 
     memset(s, 0, sizeof(*s));
     s->ctx = ctx;
@@ -40292,6 +40591,8 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
     s->allow_reference = ((flags & JS_WRITE_OBJ_REFERENCE) != 0);
     s->allow_source = ((flags & JS_WRITE_OBJ_STRIP_SOURCE) == 0);
     s->allow_debug = ((flags & JS_WRITE_OBJ_STRIP_DEBUG) == 0);
+    s->allow_transfer = ((flags & JS_WRITE_OBJ_STRUCTURED_CLONE) != 0);
+    s->transfer_tab = transfer_tab;
     /* XXX: could use a different version when bytecode is included */
     if (s->allow_bytecode)
         s->first_atom = JS_ATOM_END;
@@ -40299,6 +40600,11 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
         s->first_atom = 1;
     js_dbuf_init(ctx, &s->dbuf);
     js_object_list_init(&s->object_list);
+
+    if (transfer_tab && JS_PrepareAutoTransfers(ctx, transfer_tab))
+        goto fail;
+    if (transfer_tab)
+        transfers_prepared = true;
 
     if (JS_WriteObjectRec(s, obj))
         goto fail;
@@ -40329,7 +40635,33 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
         psab_tab->tab = NULL;
         psab_tab->len = 0;
     }
+    if (transfers_prepared)
+        JS_ReleaseAutoTransferTab(transfer_tab);
     return NULL;
+}
+
+uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
+                         int flags, JSSABTab *psab_tab)
+{
+    return JS_WriteObjectInternal(ctx, psize, obj, flags, psab_tab, NULL);
+}
+
+uint8_t *JS_WriteObject3(JSContext *ctx, size_t *psize, JSValueConst obj,
+                         int flags, JSSABTab *psab_tab,
+                         JSAutoTransferTab *transfer_tab)
+{
+    if (!(flags & JS_WRITE_OBJ_STRUCTURED_CLONE)) {
+        JS_ThrowTypeError(ctx, "JS_WriteObject3 requires structured-clone flags");
+        *psize = 0;
+        return NULL;
+    }
+    if (flags & JS_WRITE_OBJ_BYTECODE) {
+        JS_ThrowTypeError(ctx, "structured clone cannot contain bytecode");
+        *psize = 0;
+        return NULL;
+    }
+    return JS_WriteObjectInternal(ctx, psize, obj, flags, psab_tab,
+                                  transfer_tab);
 }
 
 uint8_t *JS_WriteObject(JSContext *ctx, size_t *psize, JSValueConst obj,
@@ -40348,6 +40680,8 @@ typedef struct BCReaderState {
     bool allow_sab;
     bool allow_bytecode;
     bool allow_reference;
+    bool allow_transfer;
+    JSAutoTransferTab *transfer_tab;
     /* object references */
     JSObject **objects;
     int objects_count;
@@ -41239,6 +41573,48 @@ static JSValue JS_ReadArrayBuffer(BCReaderState *s)
     return JS_EXCEPTION;
 }
 
+static JSValue JS_ReadArrayBufferTransfer(BCReaderState *s)
+{
+    JSContext *ctx = s->ctx;
+    JSAutoTransferEntry *entry;
+    JSValue obj;
+    uint32_t index;
+
+    if (!s->allow_transfer || !s->transfer_tab)
+        return JS_ThrowSyntaxError(ctx, "ArrayBuffer transfers are not allowed");
+    if (bc_get_leb128(s, &index))
+        return JS_EXCEPTION;
+    if (index >= s->transfer_tab->len)
+        return JS_ThrowSyntaxError(ctx, "invalid ArrayBuffer transfer index");
+    entry = &s->transfer_tab->tab[index];
+    if (!entry->opaque || entry->consumed ||
+        entry->byte_length > INT32_MAX ||
+        entry->max_byte_length != 0)
+        return JS_ThrowSyntaxError(ctx, "invalid ArrayBuffer transfer entry");
+
+    if (js_auto_backing_charge(ctx->rt, entry->opaque))
+        return JS_ThrowOutOfMemory(ctx);
+
+    obj = js_array_buffer_constructor3(ctx, JS_UNDEFINED,
+                                       entry->byte_length, NULL,
+                                       JS_CLASS_ARRAY_BUFFER,
+                                       entry->data,
+                                       js_auto_backing_realloc,
+                                       entry->opaque, false);
+    if (JS_IsException(obj)) {
+        js_auto_backing_uncharge(ctx->rt, entry->opaque);
+        return JS_EXCEPTION;
+    }
+    /* The receiver object now owns the wire reference. Mark it consumed
+       before any later allocation can fail and free the new object. */
+    entry->consumed = 1;
+    if (BC_add_object_ref(s, obj)) {
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
+    return obj;
+}
+
 static JSValue JS_ReadSharedArrayBuffer(BCReaderState *s)
 {
     JSContext *ctx = s->ctx;
@@ -41437,6 +41813,9 @@ static JSValue JS_ReadObjectRec(BCReaderState *s)
     case BC_TAG_ARRAY_BUFFER:
         obj = JS_ReadArrayBuffer(s);
         break;
+    case BC_TAG_ARRAY_BUFFER_TRANSFER:
+        obj = JS_ReadArrayBufferTransfer(s);
+        break;
     case BC_TAG_SHARED_ARRAY_BUFFER:
         if (!s->allow_sab || !ctx->rt->sab_funcs.sab_dup)
             goto invalid_tag;
@@ -41478,6 +41857,9 @@ static JSValue JS_ReadObjectRec(BCReaderState *s)
     case BC_TAG_SYMBOL:
         {
             JSAtom atom;
+            if (s->allow_transfer)
+                return JS_ThrowSyntaxError(ctx,
+                                           "symbols are not allowed in structured clone");
             if (bc_get_atom(s, &atom))
                 return JS_EXCEPTION;
             if (__JS_AtomIsConst(atom)) {
@@ -41579,8 +41961,10 @@ static void bc_reader_free(BCReaderState *s)
     js_free(s->ctx, s->objects);
 }
 
-JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
-                       int flags, JSSABTab *psab_tab)
+static JSValue JS_ReadObjectInternal(JSContext *ctx, const uint8_t *buf,
+                                     size_t buf_len, int flags,
+                                     JSSABTab *psab_tab,
+                                     JSAutoTransferTab *transfer_tab)
 {
     BCReaderState ss, *s = &ss;
     JSValue obj;
@@ -41596,6 +41980,8 @@ JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
     s->allow_bytecode = ((flags & JS_READ_OBJ_BYTECODE) != 0);
     s->allow_sab = ((flags & JS_READ_OBJ_SAB) != 0);
     s->allow_reference = ((flags & JS_READ_OBJ_REFERENCE) != 0);
+    s->allow_transfer = ((flags & JS_READ_OBJ_STRUCTURED_CLONE) != 0);
+    s->transfer_tab = transfer_tab;
     if (s->allow_bytecode)
         s->first_atom = JS_ATOM_END;
     else
@@ -41613,6 +41999,31 @@ JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
     }
     bc_reader_free(s);
     return obj;
+}
+
+JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
+                       int flags, JSSABTab *psab_tab)
+{
+    return JS_ReadObjectInternal(ctx, buf, buf_len, flags, psab_tab, NULL);
+}
+
+JSValue JS_ReadObject3(JSContext *ctx, const uint8_t *buf, size_t buf_len,
+                       int flags, JSSABTab *psab_tab,
+                       JSAutoTransferTab *transfer_tab)
+{
+    if (!(flags & JS_READ_OBJ_STRUCTURED_CLONE))
+        return JS_ThrowTypeError(ctx,
+                                 "JS_ReadObject3 requires structured-clone flags");
+    if (flags & JS_READ_OBJ_BYTECODE)
+        return JS_ThrowTypeError(ctx,
+                                 "structured clone cannot contain bytecode");
+    if (transfer_tab && transfer_tab->len != 0 && !transfer_tab->tab)
+        return JS_ThrowTypeError(ctx, "invalid ArrayBuffer transfer table");
+    if (transfer_tab && transfer_tab->state != JS_AUTO_TRANSFER_COMMITTED)
+        return JS_ThrowTypeError(ctx,
+                                 "ArrayBuffer transfer table is not committed");
+    return JS_ReadObjectInternal(ctx, buf, buf_len, flags, psab_tab,
+                                 transfer_tab);
 }
 
 JSValue JS_ReadObject(JSContext *ctx, const uint8_t *buf, size_t buf_len,
@@ -60126,6 +60537,7 @@ static JSValue js_array_buffer_constructor3(JSContext *ctx,
     JSRuntime *rt = ctx->rt;
     JSValue obj;
     JSArrayBuffer *abuf = NULL;
+    JSAutoBackingStore *backing = NULL;
     uint64_t sab_alloc_len;
 
     // SABs commit their maximum size upfront and are therefore never
@@ -60174,10 +60586,15 @@ static JSValue js_array_buffer_constructor3(JSContext *ctx,
                 goto fail;
             memset(abuf->data, 0, sab_alloc_len);
         } else {
-            /* the allocation must be done after the object creation */
-            abuf->data = js_mallocz(ctx, max_int(len, 1));
-            if (!abuf->data)
+            /* Keep ordinary ArrayBuffer bytes independent from the arena. */
+            backing = js_auto_backing_new(rt, len);
+            if (!backing) {
+                JS_ThrowOutOfMemory(ctx);
                 goto fail;
+            }
+            abuf->data = backing->data;
+            opaque = backing;
+            realloc_func = js_auto_backing_realloc;
         }
     } else {
         if (class_id == JS_CLASS_SHARED_ARRAY_BUFFER &&
@@ -60205,6 +60622,8 @@ static JSValue js_array_buffer_constructor3(JSContext *ctx,
     return obj;
  fail:
     JS_FreeValue(ctx, obj);
+    if (backing)
+        js_auto_backing_release(backing);
     js_free(ctx, abuf);
     return JS_EXCEPTION;
 }

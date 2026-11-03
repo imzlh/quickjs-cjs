@@ -1420,6 +1420,23 @@ typedef struct JSSABTab {
     size_t len;
 } JSSABTab;
 
+/* Cross-runtime ordinary ArrayBuffer transfers. The write side borrows
+   |value| until commit; |opaque| is a ref-counted backing descriptor. */
+typedef struct JSAutoTransferEntry {
+    JSValue value;
+    uint8_t *data;
+    size_t byte_length;
+    size_t max_byte_length;
+    void *opaque;
+    uint8_t consumed;
+} JSAutoTransferEntry;
+
+typedef struct JSAutoTransferTab {
+    JSAutoTransferEntry *tab;
+    size_t len;
+    uint8_t state;
+} JSAutoTransferTab;
+
 /* Object Writer/Reader (currently only used to handle precompiled code) */
 #define JS_WRITE_OBJ_BYTECODE  (1 << 0) /* allow function/module */
 #define JS_WRITE_OBJ_BSWAP     (0)      /* byte swapped output (obsolete, handled transparently) */
@@ -1427,9 +1444,17 @@ typedef struct JSSABTab {
 #define JS_WRITE_OBJ_REFERENCE (1 << 3) /* allow object references to encode arbitrary object graph */
 #define JS_WRITE_OBJ_STRIP_SOURCE  (1 << 4) /* do not write source code information */
 #define JS_WRITE_OBJ_STRIP_DEBUG   (1 << 5) /* do not write debug information */
+#define JS_WRITE_OBJ_STRUCTURED_CLONE (1 << 6) /* reject executable/symbol values */
 JS_EXTERN uint8_t *JS_WriteObject(JSContext *ctx, size_t *psize, JSValueConst obj, int flags);
 JS_EXTERN uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
                                    int flags, JSSABTab *psab_tab);
+JS_EXTERN uint8_t *JS_WriteObject3(JSContext *ctx, size_t *psize,
+                                   JSValueConst obj, int flags,
+                                   JSSABTab *psab_tab,
+                                   JSAutoTransferTab *transfer_tab);
+JS_EXTERN int JS_CommitArrayBufferTransfers(JSContext *ctx,
+                                            JSAutoTransferTab *transfer_tab);
+JS_EXTERN void JS_ReleaseAutoTransferTab(JSAutoTransferTab *transfer_tab);
 
 /* WARNING: only enable JS_READ_OBJ_BYTECODE on input from a trusted
    writer. The bytecode format is not designed to resist a hostile
@@ -1441,9 +1466,14 @@ JS_EXTERN uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst o
    writer in the same process (e.g. another Worker on the same runtime). */
 #define JS_READ_OBJ_SAB       (1 << 2) /* allow SharedArrayBuffer */
 #define JS_READ_OBJ_REFERENCE (1 << 3) /* allow object references */
+#define JS_READ_OBJ_STRUCTURED_CLONE (1 << 6)
 JS_EXTERN JSValue JS_ReadObject(JSContext *ctx, const uint8_t *buf, size_t buf_len, int flags);
 JS_EXTERN JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
                                  int flags, JSSABTab *psab_tab);
+JS_EXTERN JSValue JS_ReadObject3(JSContext *ctx, const uint8_t *buf,
+                                 size_t buf_len, int flags,
+                                 JSSABTab *psab_tab,
+                                 JSAutoTransferTab *transfer_tab);
 /* instantiate and evaluate a bytecode function. Only used when
    reading a script or module with JS_ReadObject() */
 JS_EXTERN JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj);
