@@ -423,6 +423,8 @@ struct JSRuntime {
     } u;
     JSModuleCheckSupportedImportAttributes *module_check_attrs;
     void *module_loader_opaque;
+    JSDynamicImportFunc *dynamic_import;
+    void *dynamic_import_opaque;
     /* timestamp for internal use in module evaluation */
     int64_t module_async_evaluation_next_timestamp;
 
@@ -9766,6 +9768,7 @@ static JSValue js_bytecode_autoinit(JSContext *ctx, JSObject *p, JSAtom atom,
                                      "Object.defineProperty", 3,
                                      JS_CFUNC_generic_magic, 0),
                 JS_AtomToValue(ctx, JS_ATOM_Symbol_iterator),
+                JS_NewCFunction(ctx, js_call_function, "call", 2),
             };
             return js_bytecode_eval(ctx, qjsc_builtin_array_fromasync,
                                     sizeof(qjsc_builtin_array_fromasync),
@@ -31566,6 +31569,13 @@ void JS_SetModuleLoaderFunc2(JSRuntime *rt,
     rt->module_loader_opaque = opaque;
 }
 
+void JS_SetDynamicImportFunc(JSRuntime *rt, JSDynamicImportFunc *func,
+                             void *opaque)
+{
+    rt->dynamic_import = func;
+    rt->dynamic_import_opaque = opaque;
+}
+
 void JS_SetModuleNormalizeFunc2(JSRuntime *rt,
                                 JSModuleNormalizeFunc2 *module_normalize)
 {
@@ -32906,17 +32916,17 @@ static void JS_LoadModuleInternal(JSContext *ctx, const char *basename,
     JS_FreeValue(ctx, evaluate_promise);
 }
 
-/* Return a promise or an exception in case of memory error. Used by
-   os.Worker() */
+/* Return a promise or an exception in case of memory error. */
 JSValue JS_LoadModule(JSContext *ctx, const char *basename,
-                      const char *filename)
+                      const char *filename, JSValueConst attributes)
 {
     JSValue promise, resolving_funcs[2];
 
     promise = JS_NewPromiseCapability(ctx, resolving_funcs);
     if (JS_IsException(promise))
         return JS_EXCEPTION;
-    JS_LoadModuleInternal(ctx, basename, filename, vc(resolving_funcs), JS_UNDEFINED);
+    JS_LoadModuleInternal(ctx, basename, filename, vc(resolving_funcs),
+                          attributes);
     JS_FreeValue(ctx, resolving_funcs[0]);
     JS_FreeValue(ctx, resolving_funcs[1]);
     return promise;
@@ -32925,12 +32935,13 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
 static JSValue js_dynamic_import_job(JSContext *ctx,
                                      int argc, JSValueConst *argv)
 {
+    JSRuntime *rt = ctx->rt;
     JSValueConst *resolving_funcs = argv;
     JSValueConst basename_val = argv[2];
     JSValueConst specifier = argv[3];
     JSValueConst attributes = argv[4];
-    const char *basename = NULL, *filename;
-    JSValue ret, err;
+    JSValue ret, err, token = JS_UNDEFINED;
+    const char *basename = NULL, *filename = NULL;
 
     if (!JS_IsString(basename_val)) {
         JS_ThrowTypeError(ctx, "no function filename for import()");
@@ -32939,12 +32950,28 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
     basename = JS_ToCString(ctx, basename_val);
     if (!basename)
         goto exception;
-
     filename = JS_ToCString(ctx, specifier);
     if (!filename)
         goto exception;
-
-    JS_LoadModuleInternal(ctx, basename, filename, resolving_funcs, attributes);
+    if (rt->dynamic_import) {
+        token = JS_NewObjectProto(ctx, JS_NULL);
+        if (JS_IsException(token))
+            goto exception;
+        if (JS_SetProperty(ctx, token, JS_ATOM_resolve,
+                           js_dup(resolving_funcs[0])) < 0) {
+            goto exception;
+        }
+        if (JS_SetProperty(ctx, token, JS_ATOM_reject,
+                           js_dup(resolving_funcs[1])) < 0) {
+            goto exception;
+        }
+        rt->dynamic_import(ctx, basename, filename, token, attributes,
+                           rt->dynamic_import_opaque);
+    } else {
+        // fallback for legacy code
+        JS_LoadModuleInternal(ctx, basename, filename, resolving_funcs,
+                              attributes);
+    }
     JS_FreeCString(ctx, filename);
     JS_FreeCString(ctx, basename);
     return JS_UNDEFINED;
@@ -32953,7 +32980,9 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
     ret = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
     JS_FreeValue(ctx, ret); /* XXX: what to do if exception ? */
     JS_FreeValue(ctx, err);
+    JS_FreeValue(ctx, token);
     JS_FreeCString(ctx, basename);
+    JS_FreeCString(ctx, filename);
     return JS_UNDEFINED;
 }
 
@@ -33059,6 +33088,43 @@ done:
     JS_FreeValue(ctx, ret);
     JS_FreeValue(ctx, err);
     goto done;
+}
+
+static JSValue js_finish_dynamic_import_job(JSContext *ctx,
+                                            int argc, JSValueConst *argv)
+{
+    JSValueConst token = argv[0];
+    JSValueConst promise = argv[1];
+    JSValueConst exception = argv[2];
+    JSValue ret, resolve, reject;
+
+    resolve = JS_GetProperty(ctx, token, JS_ATOM_resolve);
+    reject = JS_GetProperty(ctx, token, JS_ATOM_reject);
+    if (JS_IsException(promise)) {
+        ret = JS_Call(ctx, reject, JS_UNDEFINED, 1, &exception);
+    } else {
+        ret = JS_PromiseThen(ctx, promise, resolve, reject);
+    }
+    JS_FreeValue(ctx, resolve);
+    JS_FreeValue(ctx, reject);
+    return ret;
+}
+
+int JS_FinishDynamicImport(JSContext *ctx, JSValue token, JSValue promise,
+                           JSValue exception)
+{
+    JSValue args[3];
+    int ret;
+
+    args[0] = token;
+    args[1] = promise;
+    args[2] = exception;
+    ret = JS_EnqueueJob(ctx, js_finish_dynamic_import_job, countof(args),
+                        vc(args));
+    JS_FreeValue(ctx, token);
+    JS_FreeValue(ctx, promise);
+    JS_FreeValue(ctx, exception);
+    return ret;
 }
 
 static void js_set_module_evaluated(JSContext *ctx, JSModuleDef *m)
@@ -40986,9 +41052,8 @@ static int JS_ReadFunctionBytecode(BCReaderState *s, JSFunctionBytecode *b,
 
 static JSValue JS_ReadBigInt(BCReaderState *s)
 {
-    JSValue obj = JS_UNDEFINED;
     uint32_t len, i, n;
-    JSBigInt *p;
+    JSBigInt *p = NULL;
     js_limb_t v;
     uint8_t v8;
 
@@ -41027,7 +41092,7 @@ static JSValue JS_ReadBigInt(BCReaderState *s)
     bc_read_trace(s, "}\n");
     return JS_CompactBigInt(s->ctx, p);
  fail:
-    JS_FreeValue(s->ctx, obj);
+    js_free(s->ctx, p);
     return JS_EXCEPTION;
 }
 
@@ -41674,6 +41739,7 @@ static JSValue JS_ReadRegExp(BCReaderState *s)
     JSContext *ctx = s->ctx;
     JSString *pattern;
     JSString *bc;
+    JSValue obj;
 
     pattern = JS_ReadString(s);
     if (!pattern)
@@ -41692,9 +41758,16 @@ static JSValue JS_ReadRegExp(BCReaderState *s)
         return JS_ThrowInternalError(ctx, "bad regexp bytecode");
     }
 
-    return js_regexp_constructor_internal(ctx, JS_UNDEFINED,
-                                          JS_MKPTR(JS_TAG_STRING, pattern),
-                                          JS_MKPTR(JS_TAG_STRING, bc));
+    obj = js_regexp_constructor_internal(ctx, JS_UNDEFINED,
+                                         JS_MKPTR(JS_TAG_STRING, pattern),
+                                         JS_MKPTR(JS_TAG_STRING, bc));
+    if (JS_IsException(obj))
+        return JS_EXCEPTION;
+    if (BC_add_object_ref(s, obj)) {
+        JS_FreeValue(ctx, obj);
+        return JS_EXCEPTION;
+    }
+    return obj;
 }
 
 static JSValue JS_ReadDate(BCReaderState *s)
@@ -45448,6 +45521,7 @@ static JSValue js_array_find(JSContext *ctx, JSValueConst this_val,
             }
         }
         JS_FreeValue(ctx, val);
+        val = JS_UNDEFINED;
         JS_FreeValue(ctx, index_val);
     }
     JS_FreeValue(ctx, obj);
@@ -48681,6 +48755,8 @@ slow_path:
 static int string_cmp(JSString *p1, JSString *p2, int x1, int x2, int len)
 {
     int i, c1, c2;
+    if (!p1->is_wide_char && !p2->is_wide_char)
+        return memcmp(str8(p1) + x1, str8(p2) + x2, len);
     for (i = 0; i < len; i++) {
         if ((c1 = string_get(p1, x1 + i)) != (c2 = string_get(p2, x2 + i)))
             return c1 - c2;
@@ -48698,11 +48774,10 @@ static int string_indexof_char(JSString *p, int c, int from)
                 return i;
         }
     } else {
-        if ((c & ~0xff) == 0) {
-            for (i = from; i < len; i++) {
-                if (str8(p)[i] == (uint8_t)c)
-                    return i;
-            }
+        if ((c & ~0xff) == 0 && from < len) {
+            const uint8_t *q = memchr(str8(p) + from, c, len - from);
+            if (q)
+                return q - str8(p);
         }
     }
     return -1;
@@ -48856,7 +48931,10 @@ static JSValue js_string_indexOf(JSContext *ctx, JSValueConst this_val,
         inc = 1;
     }
     ret = -1;
-    if (len >= v_len && inc * (stop - start) >= 0) {
+    if (inc > 0) {
+        if (len >= v_len && start <= stop)
+            ret = string_indexof(p, p1, start);
+    } else if (len >= v_len && inc * (stop - start) >= 0) {
         for (i = start;; i += inc) {
             if (!string_cmp(p, p1, i, 0, v_len)) {
                 ret = i;
@@ -48883,7 +48961,7 @@ static JSValue js_string_includes(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv, int magic)
 {
     JSValue str, v = JS_UNDEFINED;
-    int i, len, v_len, pos, start, stop, ret;
+    int len, v_len, pos, start, stop, ret;
     JSString *p;
     JSString *p1;
 
@@ -48923,14 +49001,10 @@ static JSValue js_string_includes(JSContext *ctx, JSValueConst this_val,
         start = stop = pos;
     }
     if (start >= 0 && start <= stop) {
-        for (i = start;; i++) {
-            if (!string_cmp(p, p1, i, 0, v_len)) {
-                ret = 1;
-                break;
-            }
-            if (i == stop)
-                break;
-        }
+        if (magic == 0)
+            ret = string_indexof(p, p1, start) >= 0;
+        else
+            ret = !string_cmp(p, p1, start, 0, v_len);
     }
  done:
     JS_FreeValue(ctx, str);
@@ -51394,14 +51468,13 @@ static JSValue JS_RegExpDelete(JSContext *ctx, JSValueConst this_val, JSValue ar
     if (JS_IsException(str_val))
         goto fail;
     str = JS_VALUE_GET_STRING(str_val);
+    val = JS_GetProperty(ctx, this_val, JS_ATOM_lastIndex);
+    if (JS_IsException(val) || JS_ToLengthFree(ctx, &last_index, val))
+        goto fail;
     re_bytecode = str8(re->bytecode);
     re_flags = lre_get_flags(re_bytecode);
     if ((re_flags & (LRE_FLAG_GLOBAL | LRE_FLAG_STICKY)) == 0) {
         last_index = 0;
-    } else {
-        val = JS_GetProperty(ctx, this_val, JS_ATOM_lastIndex);
-        if (JS_IsException(val) || JS_ToLengthFree(ctx, &last_index, val))
-            goto fail;
     }
     /* size by alloc_count: the register executor uses capture[] beyond
        the capture positions for its registers (see js_regexp_exec). */
@@ -55294,12 +55367,20 @@ static void js_map_finalizer(JSRuntime *rt, JSValueConst val)
     if (s) {
         /* if the object is deleted we are sure that no iterator is
            using it */
+        if (s->is_weak) {
+            /* first pass to remove the weak references, so that freeing
+               a value (e.g. a symbol that is also a key of this map)
+               cannot reset and free records we have yet to visit */
+            list_for_each(el, &s->records) {
+                mr = list_entry(el, JSMapRecord, link);
+                if (!mr->empty)
+                    delete_map_weak_ref(rt, mr);
+            }
+        }
         list_for_each_safe(el, el1, &s->records) {
             mr = list_entry(el, JSMapRecord, link);
             if (!mr->empty) {
-                if (s->is_weak)
-                    delete_map_weak_ref(rt, mr);
-                else
+                if (!s->is_weak)
                     JS_FreeValueRT(rt, mr->key);
                 JS_FreeValueRT(rt, mr->value);
             }
@@ -58948,7 +59029,7 @@ static JSValue set_date_field(JSContext *ctx, JSValueConst this_val,
 {
     // _field(obj, first_field, end_field, args, is_local)
     double fields[9];
-    int res, first_field, end_field, is_local, i, n;
+    int res, res1, first_field, end_field, is_local, i, n;
     double d, a;
 
     d = NAN;
@@ -58959,6 +59040,7 @@ static JSValue set_date_field(JSContext *ctx, JSValueConst this_val,
     res = get_date_fields(ctx, this_val, fields, is_local, first_field == 0);
     if (res < 0)
         return JS_EXCEPTION;
+    res1 = res;
 
     // Argument coercion is observable and must be done unconditionally.
     n = min_int(argc, end_field - first_field);
@@ -58970,10 +59052,11 @@ static JSValue set_date_field(JSContext *ctx, JSValueConst this_val,
         fields[first_field + i] = trunc(a);
     }
 
-    if (!res)
-        return JS_NAN;
+    if (!res1)
+        return JS_NAN; /* thisTimeValue is NaN: leave it */
 
-    if (argc > 0)
+    /* a non-finite argument makes the new time value NaN */
+    if (res && argc > 0)
         d = set_date_fields(fields, is_local);
 
     return JS_SetThisTimeValue(ctx, this_val, d);
@@ -61495,14 +61578,8 @@ JSValue JS_GetTypedArrayBuffer(JSContext *ctx, JSValueConst obj,
     ta = p->u.typed_array;
     if (pbyte_offset)
         *pbyte_offset = ta->offset;
-    if (pbyte_length) {
-        /* Same stale-length defect as JS_GetUint8Array below: a length-tracking
-           view's live length is p->u.array.count. Unlike that function this one
-           serves every element type, so scale by the element size. */
-        *pbyte_length = ta->track_rab
-            ? (size_t) p->u.array.count << typed_array_size_log2(p->class_id)
-            : ta->length;
-    }
+    if (pbyte_length)
+        *pbyte_length = (size_t)p->u.array.count << typed_array_size_log2(p->class_id);
     if (pbytes_per_element) {
         *pbytes_per_element = 1 << typed_array_size_log2(p->class_id);
     }
@@ -61530,15 +61607,7 @@ uint8_t *JS_GetUint8Array(JSContext *ctx, size_t *psize, JSValueConst obj)
     ta = p->u.typed_array;
     abuf = ta->buffer->u.array_buffer;
 
-    /* A length-tracking view over a resizable ArrayBuffer has its LIVE length in
-       p->u.array.count; ta->length is the construction-time value. Returning the
-       stale one produced an out-of-bounds read of reclaimed heap reachable from
-       pure JS: after shrinking a 4096-byte RAB to 8 bytes, indexOf found bytes
-       from other allocations at offset 96, and Buffer.concat copied 16 bytes out
-       of a 4-byte view. typed_array_is_oob() cannot catch it — it returns false
-       early for track_rab views, before its length comparison. Uint8Array has an
-       element size of 1, so count needs no shift here. */
-    *psize = ta->track_rab ? p->u.array.count : ta->length;
+    *psize = p->u.array.count;
     return abuf->data + ta->offset;
  fail:
     *psize = 0;

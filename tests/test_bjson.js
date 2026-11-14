@@ -161,6 +161,34 @@ function bjson_test_regexp()
     assert("sup dog".match(r).groups["𝓓𝓸𝓰"], "dog");
 }
 
+function bjson_test_regexp_reference()
+{
+    var buf, r, o, o1, o2, o3, re;
+
+    /* a RegExp takes a slot in the object reference table, so the
+       references following it must still resolve to the right object */
+    o = {};
+    buf = bjson.write([/ab/g, o, o], bjson.WRITE_OBJ_REFERENCE);
+    r = bjson.read(buf, 0, buf.byteLength, bjson.READ_OBJ_REFERENCE);
+    assert(r[0].source, "ab");
+    assert(r[0].flags, "g");
+    assert(r[1] === r[2]);
+
+    o1 = {id: 1};
+    o2 = {id: 2};
+    o3 = {id: 3};
+    buf = bjson.write([/ab/g, o1, o2, o3, {v: o2}], bjson.WRITE_OBJ_REFERENCE);
+    r = bjson.read(buf, 0, buf.byteLength, bjson.READ_OBJ_REFERENCE);
+    assert(r[4].v === r[2]);
+    assert(r[4].v.id, 2);
+
+    /* the RegExp itself can be a shared reference */
+    re = /xy/i;
+    buf = bjson.write([re, re], bjson.WRITE_OBJ_REFERENCE);
+    r = bjson.read(buf, 0, buf.byteLength, bjson.READ_OBJ_REFERENCE);
+    assert(r[0] === r[1]);
+}
+
 function bjson_test_map()
 {
     var buf, r, xs;
@@ -270,6 +298,21 @@ function bjson_test_csum()
     }
 }
 
+function bjson_test_truncated_bigint()
+{
+    var buf = bjson.write(-(2n ** 100n));
+    new DataView(buf).setUint32(1, 0xFFFFFFFF, true); // disable checksum
+    for (var n = 1; n < buf.byteLength; n++) {
+        var caught = false;
+        try {
+            bjson.read(buf, 0, n);
+        } catch (e) {
+            caught = /read after the end of the buffer/.test(e.message);
+        }
+        assert(caught);
+    }
+}
+
 function bjson_test_atom()
 {
     var o = {return:1, with:2, Map:3}; // Map tests LEB128 encoding
@@ -309,6 +352,7 @@ function bjson_test_all()
     bjson_test_arraybuffer();
     bjson_test_reference();
     bjson_test_regexp();
+    bjson_test_regexp_reference();
     bjson_test_map();
     bjson_test_set();
     bjson_test_symbol();
@@ -316,6 +360,7 @@ function bjson_test_all()
     bjson_test_fuzz();
     bjson_test_csum();
     bjson_test_atom();
+    bjson_test_truncated_bigint();
 }
 
 bjson_test_all();
