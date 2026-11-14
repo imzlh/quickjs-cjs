@@ -418,7 +418,670 @@ static void module_serde(void)
     assert(JS_IsUndefined(result));
     JS_FreeValue(ctx, result);
     JS_FreeValue(ctx, ret);
-    JS_FreeValue(ctx, mod);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+struct resolve_retry_state {
+    int root_calls;
+    int leaf_calls;
+    JSValue retry_module;
+};
+
+static JSModuleDef *resolve_retry_loader(JSContext *ctx, const char *name,
+                                         void *opaque)
+{
+    static const char root_code[] =
+        "import 'resolve-retry-bridge';"
+        "import { value } from 'resolve-retry-leaf';"
+        "globalThis.resolveRetryValue = value";
+    static const char bridge_code[] = "import 'resolve-retry-root'";
+    static const char leaf_code[] = "export const value = 42";
+    struct resolve_retry_state *state = opaque;
+    const char *code;
+    JSValue module;
+    JSModuleDef *m;
+
+    if (!strcmp(name, "resolve-retry-root")) {
+        state->root_calls++;
+        code = root_code;
+    } else if (!strcmp(name, "resolve-retry-bridge")) {
+        code = bridge_code;
+    } else if (!strcmp(name, "resolve-retry-leaf")) {
+        state->leaf_calls++;
+        if (state->leaf_calls == 1) {
+            JS_ThrowReferenceError(ctx, "intentional first loader failure");
+            return NULL;
+        }
+        code = leaf_code;
+    } else {
+        JS_ThrowReferenceError(ctx, "unexpected retry module '%s'", name);
+        return NULL;
+    }
+    module = JS_Eval(ctx, code, strlen(code), name,
+                     JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    if (JS_IsException(module))
+        return NULL;
+    m = JS_VALUE_GET_PTR(module);
+    if (!strcmp(name, "resolve-retry-bridge"))
+        state->retry_module = JS_DupValue(ctx, module);
+    JS_FreeValue(ctx, module);
+    return m;
+}
+
+static void module_resolve_retry(void)
+{
+    static const char entry_code[] = "import 'resolve-retry-root'";
+    struct resolve_retry_state state = { .retry_module = JS_UNDEFINED };
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue result, error, global, value;
+    int32_t n;
+
+    JS_SetModuleLoaderFunc(rt, NULL, resolve_retry_loader, &state);
+    result = JS_Eval(ctx, entry_code, strlen(entry_code), "resolve-retry-entry",
+                     JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    assert(JS_IsException(result));
+    error = JS_GetException(ctx);
+    assert(JS_IsError(error));
+    JS_FreeValue(ctx, error);
+    assert(state.root_calls == 1);
+    assert(state.leaf_calls == 1);
+    assert(JS_IsModule(state.retry_module));
+
+    /* A fresh importer must reuse root's unresolved tombstone and retry the
+       missing leaf without invoking the root loader a second time. */
+    result = JS_Eval(ctx, entry_code, strlen(entry_code),
+                     "resolve-retry-entry-2",
+                     JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    assert(!JS_IsException(result));
+    assert(state.root_calls == 1);
+    assert(state.leaf_calls == 2);
+    result = JS_EvalFunction(ctx, result);
+    assert(!JS_IsException(result));
+    assert(JS_PromiseState(ctx, result) == JS_PROMISE_FULFILLED);
+    JS_FreeValue(ctx, result);
+    global = JS_GetGlobalObject(ctx);
+    value = JS_GetPropertyStr(ctx, global, "resolveRetryValue");
+    assert(JS_ToInt32(ctx, &n, value) == 0);
+    assert(n == 42);
+    JS_FreeValue(ctx, value);
+    JS_FreeValue(ctx, global);
+    JS_FreeValue(ctx, state.retry_module);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+static void module_parse_failure_cleanup(void)
+{
+    static const char invalid_code[] = "export const = 1";
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue result, error;
+
+    result = JS_Eval(ctx, invalid_code, strlen(invalid_code),
+                     "module-parse-failure",
+                     JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    assert(JS_IsException(result));
+    error = JS_GetException(ctx);
+    assert(JS_IsError(error));
+    JS_FreeValue(ctx, error);
+    JS_FreeContext(ctx);
+    /* new_runtime() enables JS_ABORT_ON_LEAKS, so this also verifies that the
+       unpublished parse-failure path still frees its module immediately. */
+    JS_FreeRuntime(rt);
+}
+
+struct create_retry_state {
+    int c_calls;
+    int reentrant_failures;
+    JSValue retry_module;
+};
+
+static JSModuleDef *create_retry_loader(JSContext *ctx, const char *name,
+                                        void *opaque)
+{
+    static const char b_code[] =
+        "import { fromD } from 'create-retry-d';"
+        "export function fromB(){return fromD()}";
+    static const char d_code[] =
+        "import { fromE } from 'create-retry-e';"
+        "import 'create-retry-entry';"
+        "export function fromD(){return fromE()}";
+    static const char e_code[] =
+        "import 'create-retry-d';"
+        "export function fromE(){return 40}";
+    static const char c_code[] = "export function fromC(){return 2}";
+    struct create_retry_state *state = opaque;
+    const char *code;
+    JSValue module, result, error;
+    JSModuleDef *m;
+
+    if (!strcmp(name, "create-retry-b"))
+        code = b_code;
+    else if (!strcmp(name, "create-retry-d"))
+        code = d_code;
+    else if (!strcmp(name, "create-retry-e"))
+        code = e_code;
+    else if (!strcmp(name, "create-retry-c")) {
+        state->c_calls++;
+        if (state->c_calls == 1) {
+            JS_ThrowReferenceError(ctx, "intentional create-pass failure");
+            return NULL;
+        }
+        code = c_code;
+    } else {
+        JS_ThrowReferenceError(ctx, "unexpected retry module '%s'", name);
+        return NULL;
+    }
+
+    module = JS_Eval(ctx, code, strlen(code), name,
+                     JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    if (JS_IsException(module))
+        return NULL;
+    m = JS_VALUE_GET_PTR(module);
+    if (!strcmp(name, "create-retry-e")) {
+        JS_FreeValue(ctx, state->retry_module);
+        state->retry_module = JS_DupValue(ctx, module);
+    }
+
+    /* The outer entry has not assigned its B request slot yet and has not
+       visited C.  Re-entering through B creates E successfully, then reaches
+       the still-unresolved C slot through D -> entry and fails.  E is the
+       completed member whose stale func_created flag used to poison retry. */
+    if (!strcmp(name, "create-retry-b")) {
+        result = JS_EvalFunction(ctx, JS_DupValue(ctx, module));
+        assert(JS_IsException(result));
+        error = JS_GetException(ctx);
+        assert(JS_IsError(error));
+        JS_FreeValue(ctx, error);
+        state->reentrant_failures++;
+    }
+    JS_FreeValue(ctx, module);
+    return m;
+}
+
+static void module_create_retry_from_cycle_peer(void)
+{
+    static const char entry_code[] =
+        "import { fromB } from 'create-retry-b';"
+        "import { fromC } from 'create-retry-c';"
+        "globalThis.createRetryValue = fromB() + fromC()";
+    struct create_retry_state state = { .retry_module = JS_UNDEFINED };
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue entry, result, global, value;
+    int32_t n;
+
+    JS_SetModuleLoaderFunc(rt, NULL, create_retry_loader, &state);
+    entry = JS_Eval(ctx, entry_code, strlen(entry_code), "create-retry-entry",
+                    JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    assert(!JS_IsException(entry));
+    assert(state.reentrant_failures == 1);
+    assert(state.c_calls == 2);
+    assert(JS_IsModule(state.retry_module));
+
+    /* Retry from E, not from the ancestor that originally failed.  A stale
+       completed marker on E must not skip the path to the newly loaded C. */
+    result = JS_EvalFunction(ctx, JS_DupValue(ctx, state.retry_module));
+    assert(!JS_IsException(result));
+    assert(JS_PromiseState(ctx, result) == JS_PROMISE_FULFILLED);
+    JS_FreeValue(ctx, result);
+    global = JS_GetGlobalObject(ctx);
+    value = JS_GetPropertyStr(ctx, global, "createRetryValue");
+    assert(JS_ToInt32(ctx, &n, value) == 0);
+    assert(n == 42);
+    JS_FreeValue(ctx, value);
+    JS_FreeValue(ctx, global);
+    JS_FreeValue(ctx, state.retry_module);
+    JS_FreeValue(ctx, entry);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+static void cfunctiondata_rejects_module_handles(void)
+{
+    static const char code[] = "export const value = 1";
+    JSRuntime *rt1 = new_runtime();
+    JSRuntime *rt2 = new_runtime();
+    JSContext *owner = JS_NewContext(rt1);
+    JSContext *peer = JS_NewContext(rt1);
+    JSContext *foreign = JS_NewContext(rt2);
+    JSValue module, other_module, func, error, data[2];
+
+    module = JS_Eval(owner, code, strlen(code), "captured-module",
+                     JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    other_module = JS_Eval(peer, code, strlen(code), "other-captured-module",
+                           JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    assert(!JS_IsException(module));
+    assert(!JS_IsException(other_module));
+
+    func = JS_NewCFunctionData2(owner, cfuncdata_callback, "capture", 0, 0,
+                                1, &module);
+    assert(JS_IsException(func));
+    error = JS_GetException(owner);
+    assert(JS_IsError(error));
+    JS_FreeValue(owner, error);
+
+    func = JS_NewCFunctionData2(peer, cfuncdata_callback, "capture", 0, 0,
+                                1, &module);
+    assert(JS_IsException(func));
+    error = JS_GetException(peer);
+    assert(JS_IsError(error));
+    JS_FreeValue(peer, error);
+
+    func = JS_NewCFunctionData2(foreign, cfuncdata_callback, "capture", 0, 0,
+                                1, &module);
+    assert(JS_IsException(func));
+    error = JS_GetException(foreign);
+    assert(JS_IsError(error));
+    JS_FreeValue(foreign, error);
+
+    data[0] = module;
+    data[1] = other_module;
+    func = JS_NewCFunctionData2(owner, cfuncdata_callback, "capture", 0, 0,
+                                2, data);
+    assert(JS_IsException(func));
+    error = JS_GetException(owner);
+    assert(JS_IsError(error));
+    JS_FreeValue(owner, error);
+
+    JS_FreeValue(peer, other_module);
+    JS_FreeValue(owner, module);
+    JS_FreeContext(peer);
+    JS_FreeContext(owner);
+    JS_FreeRuntime(rt1);
+    JS_FreeContext(foreign);
+    JS_FreeRuntime(rt2);
+}
+
+static void module_apis_reject_foreign_context(void)
+{
+    static const char code[] = "export const value = 1";
+    JSRuntime *rt = new_runtime();
+    JSRuntime *foreign_rt = new_runtime();
+    JSContext *owner = JS_NewContext(rt);
+    JSContext *peer = JS_NewContext(rt);
+    JSContext *foreign = JS_NewContext(foreign_rt);
+    JSValue module, value, error, result;
+    JSModuleDef *m;
+    JSAtom name;
+
+    module = JS_Eval(owner, code, strlen(code), "owned-module",
+                     JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    assert(!JS_IsException(module));
+    m = JS_VALUE_GET_PTR(module);
+
+    assert(JS_ResolveModule(peer, module) < 0);
+    error = JS_GetException(peer);
+    assert(JS_IsError(error));
+    JS_FreeValue(peer, error);
+
+    value = JS_GetModuleNamespace(peer, m);
+    assert(JS_IsException(value));
+    error = JS_GetException(peer);
+    assert(JS_IsError(error));
+    JS_FreeValue(peer, error);
+
+    name = JS_NewAtom(peer, "foreign");
+    assert(name != JS_ATOM_NULL);
+    assert(JS_DefineModuleExport(peer, m, name, JS_NewInt32(peer, 2)) == NULL);
+    JS_FreeAtom(peer, name);
+    error = JS_GetException(peer);
+    assert(JS_IsError(error));
+    JS_FreeValue(peer, error);
+
+    assert(JS_ResolveModule(foreign, module) < 0);
+    error = JS_GetException(foreign);
+    assert(JS_IsError(error));
+    JS_FreeValue(foreign, error);
+
+    /* Rejected foreign operations must not poison the owner module. */
+    result = JS_EvalFunction(owner, JS_DupValue(owner, module));
+    assert(!JS_IsException(result));
+    assert(JS_PromiseState(owner, result) == JS_PROMISE_FULFILLED);
+    JS_FreeValue(owner, result);
+
+    JS_FreeValue(owner, module);
+    JS_FreeContext(peer);
+    JS_FreeContext(owner);
+    JS_FreeRuntime(rt);
+    JS_FreeContext(foreign);
+    JS_FreeRuntime(foreign_rt);
+}
+
+static void module_handle_outlives_owner_context(void)
+{
+    static const char code[] = "export const value = 1";
+    JSRuntime *rt = new_runtime();
+    JSRuntime *foreign_rt = new_runtime();
+    JSContext *owner = JS_NewContext(rt);
+    JSContext *peer = JS_NewContext(rt);
+    JSContext *foreign = JS_NewContext(foreign_rt);
+    JSValue module, second, value, error;
+
+    module = JS_Eval(owner, code, strlen(code), "expired-owner-module",
+                     JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    assert(!JS_IsException(module));
+    second = JS_DupValue(owner, module);
+
+    /* Module bytecode normally pins its creation realm.  Collection after
+       releasing the host reference tears down that cycle and leaves the two
+       external module handles as resource-free expired shells. */
+    JS_FreeContext(owner);
+    JS_RunGC(rt);
+
+    assert(JS_ResolveModule(peer, module) < 0);
+    error = JS_GetException(peer);
+    assert(JS_IsError(error));
+    JS_FreeValue(peer, error);
+
+    value = JS_EvalFunction(peer, JS_DupValue(peer, module));
+    assert(JS_IsException(value));
+    error = JS_GetException(peer);
+    assert(JS_IsError(error));
+    JS_FreeValue(peer, error);
+
+    assert(JS_ResolveModule(foreign, module) < 0);
+    error = JS_GetException(foreign);
+    assert(JS_IsError(error));
+    JS_FreeValue(foreign, error);
+
+    value = JS_EvalFunction(foreign, JS_DupValue(foreign, module));
+    assert(JS_IsException(value));
+    error = JS_GetException(foreign);
+    assert(JS_IsError(error));
+    JS_FreeValue(foreign, error);
+
+    /* Foreign-runtime Dup/Free is deliberately borrowed/no-op.  Such a raw
+       alias is valid only while the origin runtime and one of its handles are
+       alive; it must never outlive the origin runtime.  A same-runtime peer
+       may own and free a duplicate, while final release uses the allocation's
+       origin runtime after its context has gone away. */
+    value = JS_DupValue(foreign, module);
+    JS_FreeValue(foreign, value);
+    value = JS_DupValue(peer, module);
+    JS_FreeValue(peer, value);
+    JS_FreeValue(peer, second);
+    JS_FreeValueRT(rt, module);
+
+    JS_FreeContext(peer);
+    JS_FreeRuntime(rt);
+    JS_FreeContext(foreign);
+    JS_FreeRuntime(foreign_rt);
+}
+
+static JSModuleDef *runtime_export_provider;
+
+static JSModuleDef *runtime_export_loader(JSContext *ctx, const char *name,
+                                          void *opaque)
+{
+    (void)ctx;
+    (void)opaque;
+    if (!strcmp(name, "runtime-provider"))
+        return runtime_export_provider;
+    return NULL;
+}
+
+static void compiled_module_namespace_before_link(void)
+{
+    static const char code[] = "export const value = 1";
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue module, ns, promise, value;
+    int32_t result;
+
+    module = JS_Eval(ctx, code, strlen(code), "namespace-before-link",
+                     JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    assert(!JS_IsException(module));
+    ns = JS_GetModuleNamespace(ctx, JS_VALUE_GET_PTR(module));
+    assert(JS_IsException(ns));
+    value = JS_GetException(ctx);
+    assert(JS_IsError(value));
+    JS_FreeValue(ctx, value);
+
+    promise = JS_EvalFunction(ctx, JS_DupValue(ctx, module));
+    assert(!JS_IsException(promise));
+    assert(JS_PromiseState(ctx, promise) == JS_PROMISE_FULFILLED);
+    JS_FreeValue(ctx, promise);
+    ns = JS_GetModuleNamespace(ctx, JS_VALUE_GET_PTR(module));
+    assert(!JS_IsException(ns));
+    value = JS_GetPropertyStr(ctx, ns, "value");
+    assert(JS_ToInt32(ctx, &result, value) == 0);
+    assert(result == 1);
+    JS_FreeValue(ctx, value);
+    JS_FreeValue(ctx, ns);
+    JS_FreeValue(ctx, module);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+static void compiled_module_runtime_exports(void)
+{
+    static const char provider_code[] = "export const fixed = 1";
+    static const char consumer_code[] =
+        "import { fixed, extra } from 'runtime-provider';"
+        "globalThis.runtimeExportRead = () => [fixed, extra]";
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue provider, consumer, promise, global, read, pair, value, ns;
+    JSAtom extra_atom;
+    int32_t result;
+
+    provider = JS_Eval(ctx, provider_code, strlen(provider_code),
+                       "runtime-provider",
+                       JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    assert(!JS_IsException(provider));
+    runtime_export_provider = JS_VALUE_GET_PTR(provider);
+    extra_atom = JS_NewAtom(ctx, "extra");
+    assert(extra_atom != JS_ATOM_NULL);
+    assert(JS_DefineModuleExport(ctx, runtime_export_provider, extra_atom,
+                                 JS_NewInt32(ctx, 10)) != NULL);
+
+    JS_SetModuleLoaderFunc(rt, NULL, runtime_export_loader, NULL);
+    consumer = JS_Eval(ctx, consumer_code, strlen(consumer_code),
+                       "runtime-consumer",
+                       JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    assert(!JS_IsException(consumer));
+    promise = JS_EvalFunction(ctx, JS_DupValue(ctx, consumer));
+    assert(!JS_IsException(promise));
+    assert(JS_PromiseState(ctx, promise) == JS_PROMISE_FULFILLED);
+    JS_FreeValue(ctx, promise);
+
+    global = JS_GetGlobalObject(ctx);
+    read = JS_GetPropertyStr(ctx, global, "runtimeExportRead");
+    pair = JS_Call(ctx, read, JS_UNDEFINED, 0, NULL);
+    value = JS_GetPropertyUint32(ctx, pair, 1);
+    assert(JS_ToInt32(ctx, &result, value) == 0);
+    assert(result == 10);
+    JS_FreeValue(ctx, value);
+    JS_FreeValue(ctx, pair);
+
+    assert(JS_DefineModuleExport(ctx, runtime_export_provider, extra_atom,
+                                 JS_NewInt32(ctx, 20)) != NULL);
+    pair = JS_Call(ctx, read, JS_UNDEFINED, 0, NULL);
+    value = JS_GetPropertyUint32(ctx, pair, 1);
+    assert(JS_ToInt32(ctx, &result, value) == 0);
+    assert(result == 20);
+    JS_FreeValue(ctx, value);
+    JS_FreeValue(ctx, pair);
+    JS_FreeValue(ctx, read);
+    JS_FreeValue(ctx, global);
+
+    ns = JS_GetModuleNamespace(ctx, runtime_export_provider);
+    assert(!JS_IsException(ns));
+    value = JS_GetProperty(ctx, ns, extra_atom);
+    assert(JS_ToInt32(ctx, &result, value) == 0);
+    assert(result == 20);
+    JS_FreeValue(ctx, value);
+    JS_FreeValue(ctx, ns);
+    JS_FreeAtom(ctx, extra_atom);
+    JS_FreeValue(ctx, consumer);
+    JS_FreeValue(ctx, provider);
+    runtime_export_provider = NULL;
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+struct link_retry_state {
+    JSModuleDef *provider;
+};
+
+static JSModuleDef *link_retry_loader(JSContext *ctx, const char *name,
+                                      void *opaque)
+{
+    static const char b_code[] =
+        "import { fromA } from 'link-retry-a';"
+        "import * as providerNS from 'link-retry-provider';"
+        "import { existing } from 'link-retry-provider';"
+        "export { existing as echoed };"
+        "export function fromB(){return fromA()+providerNS.existing+existing}";
+    struct link_retry_state *state = opaque;
+    JSValue module;
+    JSModuleDef *m;
+
+    if (!strcmp(name, "link-retry-provider"))
+        return state->provider;
+    if (strcmp(name, "link-retry-b")) {
+        JS_ThrowReferenceError(ctx, "unexpected link retry module '%s'", name);
+        return NULL;
+    }
+    module = JS_Eval(ctx, b_code, strlen(b_code), name,
+                     JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    if (JS_IsException(module))
+        return NULL;
+    m = JS_VALUE_GET_PTR(module);
+    JS_FreeValue(ctx, module);
+    return m;
+}
+
+static void module_link_retry_after_runtime_export(void)
+{
+    static const char a_code[] =
+        "import { fromB, echoed } from 'link-retry-b';"
+        "import { existing, missing } from 'link-retry-provider';"
+        "export function fromA(){return 1}"
+        "globalThis.linkRetryValue=fromB()+echoed+missing";
+    struct link_retry_state state;
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue entry, result, error, global, value;
+    JSAtom existing_atom, missing_atom;
+    int32_t n;
+    int i;
+
+    state.provider = JS_NewCModule2(ctx, "link-retry-provider");
+    assert(state.provider);
+    existing_atom = JS_NewAtom(ctx, "existing");
+    missing_atom = JS_NewAtom(ctx, "missing");
+    assert(existing_atom != JS_ATOM_NULL);
+    assert(missing_atom != JS_ATOM_NULL);
+    assert(JS_DefineModuleExport(ctx, state.provider, existing_atom,
+                                 JS_NewInt32(ctx, 20)) != NULL);
+    JS_SetModuleLoaderFunc(rt, NULL, link_retry_loader, &state);
+
+    entry = JS_Eval(ctx, a_code, strlen(a_code), "link-retry-a",
+                    JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    assert(!JS_IsException(entry));
+
+    /* B completes its side of the A <-> B linking cycle before A discovers
+       the missing provider export. Repeating the failed link pass exercises
+       replacement of direct-import, namespace and static-export bindings.
+       new_runtime() enables JS_ABORT_ON_LEAKS, so stale var_ref ownership is
+       also checked when the context is torn down. */
+    for(i = 0; i < 16; i++) {
+        result = JS_EvalFunction(ctx, JS_DupValue(ctx, entry));
+        assert(JS_IsException(result));
+        error = JS_GetException(ctx);
+        assert(JS_IsError(error));
+        JS_FreeValue(ctx, error);
+    }
+
+    assert(JS_DefineModuleExport(ctx, state.provider, missing_atom,
+                                 JS_NewInt32(ctx, 2)) != NULL);
+    result = JS_EvalFunction(ctx, JS_DupValue(ctx, entry));
+    assert(!JS_IsException(result));
+    assert(JS_PromiseState(ctx, result) == JS_PROMISE_FULFILLED);
+    JS_FreeValue(ctx, result);
+
+    global = JS_GetGlobalObject(ctx);
+    value = JS_GetPropertyStr(ctx, global, "linkRetryValue");
+    assert(JS_ToInt32(ctx, &n, value) == 0);
+    assert(n == 63);
+    JS_FreeValue(ctx, value);
+    JS_FreeValue(ctx, global);
+    JS_FreeAtom(ctx, missing_atom);
+    JS_FreeAtom(ctx, existing_atom);
+    JS_FreeValue(ctx, entry);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+static int reentrant_module_loader_calls;
+
+static JSModuleDef *reentrant_module_loader(JSContext *ctx, const char *name,
+                                            void *opaque)
+{
+    static const char a_code[] =
+        "import { valueB } from './b.js';"
+        "export function valueA(){return 1;}"
+        "export function result(){return valueB();}";
+    static const char b_code[] =
+        "import { valueA } from './a.js';"
+        "export function valueB(){return valueA()+1;}";
+    const char *code;
+    JSModuleDef *m;
+    JSValue module, result;
+
+    (void)opaque;
+    reentrant_module_loader_calls++;
+    if (!strcmp(name, "a.js"))
+        code = a_code;
+    else if (!strcmp(name, "b.js"))
+        code = b_code;
+    else
+        return NULL;
+
+    module = JS_Eval(ctx, code, strlen(code), name,
+                     JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    if (JS_IsException(module))
+        return NULL;
+    m = JS_VALUE_GET_PTR(module);
+
+    /* Re-enter module evaluation before returning the module to the outer
+       resolver.  In a cycle one dependency slot is still NULL at this point. */
+    result = JS_EvalFunction(ctx, JS_DupValue(ctx, module));
+    JS_FreeValue(ctx, module);
+    if (JS_IsException(result))
+        return NULL;
+    JS_FreeValue(ctx, result);
+    return m;
+}
+
+static void reentrant_circular_module_evaluation(void)
+{
+    static const char entry_code[] =
+        "import { result } from './a.js';"
+        "globalThis.circularResult = result();";
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue ret, global, value;
+    int32_t result;
+
+    reentrant_module_loader_calls = 0;
+    JS_SetModuleLoaderFunc(rt, NULL, reentrant_module_loader, NULL);
+    ret = JS_Eval(ctx, entry_code, strlen(entry_code), "entry.js",
+                  JS_EVAL_TYPE_MODULE);
+    assert(!JS_IsException(ret));
+    JS_FreeValue(ctx, ret);
+    assert(reentrant_module_loader_calls == 2);
+
+    global = JS_GetGlobalObject(ctx);
+    value = JS_GetPropertyStr(ctx, global, "circularResult");
+    assert(JS_ToInt32(ctx, &result, value) == 0);
+    assert(result == 2);
+    JS_FreeValue(ctx, value);
+    JS_FreeValue(ctx, global);
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
 }
@@ -573,6 +1236,145 @@ static void promise_then(void)
 
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
+}
+
+static JSValue cfunctiondata_realm_callback(JSContext *ctx,
+                                            JSValueConst this_val,
+                                            int argc, JSValueConst *argv,
+                                            int magic,
+                                            JSValueConst *func_data)
+{
+    int *marker = JS_GetContextOpaque(ctx);
+
+    assert(marker);
+    assert(*marker == 42);
+    return JS_NewInt32(ctx, *marker);
+}
+
+static void cfunctiondata_creation_realm(void)
+{
+    int marker = 42;
+    JSRuntime *rt = new_runtime();
+    JSContext *owner = JS_NewContext(rt);
+    JSContext *peer = JS_NewContext(rt);
+    JSValue global, func, ret, array_ctor, owner_array_ctor;
+    JSValue owner_array_proto, array, array_proto;
+    int32_t value;
+
+    JS_SetContextOpaque(owner, &marker);
+    func = JS_NewCFunctionData2(owner, cfunctiondata_realm_callback,
+                                "realmCallback", 0, 0, 0, NULL);
+    assert(!JS_IsException(func));
+    global = JS_GetGlobalObject(owner);
+    assert(JS_SetPropertyStr(owner, global, "realmCallback",
+                             JS_DupValue(owner, func)) == 1);
+    owner_array_ctor = JS_GetPropertyStr(owner, global, "Array");
+    assert(JS_IsFunction(owner, owner_array_ctor));
+    owner_array_proto = JS_GetPropertyStr(owner, owner_array_ctor,
+                                          "prototype");
+    assert(JS_IsObject(owner_array_proto));
+    JS_FreeValue(owner, global);
+
+    /* Constructor prototype fallback consults JS_GetFunctionRealm(newTarget).
+       A CFunctionData newTarget therefore selects its creating realm's Array
+       prototype even when the constructor call originates in peer. */
+    assert(JS_SetConstructorBit(owner, func, true));
+    global = JS_GetGlobalObject(peer);
+    array_ctor = JS_GetPropertyStr(peer, global, "Array");
+    JS_FreeValue(peer, global);
+    assert(JS_IsFunction(peer, array_ctor));
+    array = JS_CallConstructor2(peer, array_ctor, func, 0, NULL);
+    assert(!JS_IsException(array));
+    array_proto = JS_GetPrototype(peer, array);
+    assert(JS_IsSameValue(peer, array_proto, owner_array_proto));
+    JS_FreeValue(peer, array_proto);
+    JS_FreeValue(peer, array);
+    JS_FreeValue(peer, array_ctor);
+    JS_FreeValue(peer, owner_array_proto);
+    JS_FreeValue(peer, owner_array_ctor);
+
+    /* The function pins its creating realm and must enter it even when called
+       through another context after the host releases its owner reference. */
+    JS_FreeContext(owner);
+    ret = JS_Call(peer, func, JS_UNDEFINED, 0, NULL);
+    assert(!JS_IsException(ret));
+    assert(JS_ToInt32(peer, &value, ret) == 0);
+    assert(value == 42);
+    JS_FreeValue(peer, ret);
+    JS_FreeValue(peer, func);
+
+    /* owner.globalThis -> function -> owner is deliberately a cycle. */
+    JS_RunGC(rt);
+    JS_FreeContext(peer);
+    JS_FreeRuntime(rt);
+}
+
+static void tla_cross_realm_resume(bool reject)
+{
+    static const char fulfill_code[] =
+        "globalThis.tlaDone = false;"
+        "const gate = new Promise(resolve => globalThis.tlaResume = resolve);"
+        "await gate;"
+        "globalThis.tlaDone = true;";
+    static const char reject_code[] =
+        "globalThis.tlaDone = false;"
+        "const gate = new Promise((resolve, reject) => "
+        "  globalThis.tlaResume = reject);"
+        "await gate;"
+        "globalThis.tlaDone = true;";
+    const char *code = reject ? reject_code : fulfill_code;
+    JSRuntime *rt = new_runtime();
+    JSContext *owner = JS_NewContext(rt);
+    JSContext *peer = JS_NewContext(rt);
+    JSContext *job_ctx;
+    JSValue promise, global, resume, arg, ret, done;
+    int status;
+
+    promise = JS_Eval(owner, code, strlen(code),
+                      reject ? "tla-reject.js" : "tla-fulfill.js",
+                      JS_EVAL_TYPE_MODULE);
+    assert(!JS_IsException(promise));
+    assert(JS_IsPromise(promise));
+    assert(JS_PromiseState(owner, promise) == JS_PROMISE_PENDING);
+    global = JS_GetGlobalObject(owner);
+    resume = JS_GetPropertyStr(owner, global, "tlaResume");
+    assert(JS_IsFunction(owner, resume));
+
+    /* Calling the user-visible resolver from peer makes the promise job
+       originate in peer, so TLA's internal CFunctionData callbacks must
+       switch back to owner to find their module. */
+    JS_FreeContext(owner);
+    arg = reject ? JS_NewString(peer, "tla rejection") : JS_UNDEFINED;
+    ret = JS_Call(peer, resume, JS_UNDEFINED, 1, (JSValueConst *)&arg);
+    assert(!JS_IsException(ret));
+    JS_FreeValue(peer, ret);
+    JS_FreeValue(peer, arg);
+    JS_RunGC(rt);
+
+    while ((status = JS_ExecutePendingJob(rt, &job_ctx)) > 0)
+        ;
+    assert(status == 0);
+    assert(JS_PromiseState(peer, promise) ==
+           (reject ? JS_PROMISE_REJECTED : JS_PROMISE_FULFILLED));
+    done = JS_GetPropertyStr(peer, global, "tlaDone");
+    assert(JS_IsBool(done));
+    assert(JS_ToBool(peer, done) == !reject);
+    JS_FreeValue(peer, done);
+    if (reject)
+        JS_PromiseMarkAsHandled(peer, promise);
+
+    JS_FreeValue(peer, resume);
+    JS_FreeValue(peer, global);
+    JS_FreeValue(peer, promise);
+    JS_RunGC(rt);
+    JS_FreeContext(peer);
+    JS_FreeRuntime(rt);
+}
+
+static void tla_cross_realm_callbacks(void)
+{
+    tla_cross_realm_resume(false);
+    tla_cross_realm_resume(true);
 }
 
 static void runtime_cstring_free(void)
@@ -1745,6 +2547,46 @@ static void detach_array_buffer_free_once(void)
     JS_FreeRuntime(rt);
 }
 
+static void detach_array_buffer_runtime_api(void)
+{
+    JSValue obj;
+    uint8_t *buf;
+    size_t size = 1;
+    JSRuntime *rt = new_runtime();
+    JSContext *ctx = JS_NewContext(rt);
+
+    detach_free_count = 0;
+    buf = malloc(8);
+    obj = JS_NewArrayBuffer(ctx, buf, 8, /*max_len*/0, detach_realloc_func,
+                            NULL, false);
+    assert(JS_IsArrayBuffer(obj));
+    assert(JS_DetachArrayBufferRT(rt, obj) == 0);
+    assert(detach_free_count == 1);
+    assert(JS_GetArrayBuffer(ctx, &size, obj) == NULL);
+    assert(size == 0);
+    assert(JS_HasException(ctx));
+    JSValue error = JS_GetException(ctx);
+    assert(JS_IsError(error));
+    JS_FreeValue(ctx, error);
+
+    /* The finalizer-safe path cannot manufacture an exception without a
+       context, but it must still refuse a pinned backing store. */
+    JS_FreeValue(ctx, obj);
+    buf = malloc(8);
+    obj = JS_NewArrayBuffer(ctx, buf, 8, /*max_len*/0, detach_realloc_func,
+                            NULL, false);
+    assert(JS_PinArrayBuffer(ctx, obj) == 0);
+    assert(JS_DetachArrayBufferRT(rt, obj) == -1);
+    assert(detach_free_count == 1);
+    assert(!JS_HasException(ctx));
+    assert(JS_UnpinArrayBuffer(obj) == 0);
+    JS_FreeValue(ctx, obj);
+    assert(detach_free_count == 2);
+
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
 static void *realloc_array_buffer_data(JSRuntime *rt, void *opaque, void *ptr,
                                        size_t size)
 {
@@ -2619,6 +3461,16 @@ int main(void)
     raw_context_global_var();
     is_array();
     module_serde();
+    module_resolve_retry();
+    module_parse_failure_cleanup();
+    module_create_retry_from_cycle_peer();
+    cfunctiondata_rejects_module_handles();
+    module_apis_reject_foreign_context();
+    module_handle_outlives_owner_context();
+    compiled_module_namespace_before_link();
+    compiled_module_runtime_exports();
+    module_link_retry_after_runtime_export();
+    reentrant_circular_module_evaluation();
     module_unhandled_rejection();
     dynamic_import_sync_ok();
     dynamic_import_sync_missing();
@@ -2626,6 +3478,8 @@ int main(void)
     dynamic_import_deferred_reject();
     promise_mark_as_handled();
     promise_then();
+    cfunctiondata_creation_realm();
+    tla_cross_realm_callbacks();
     runtime_cstring_free();
     utf16_string();
     weak_map_gc_check();
@@ -2647,6 +3501,7 @@ int main(void)
     new_symbol();
     bulk_free_macros();
     detach_array_buffer_free_once();
+    detach_array_buffer_runtime_api();
     typed_array_sort_index_overflow();
     transfer_external_array_buffer();
     resize_external_array_buffer();

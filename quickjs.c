@@ -628,6 +628,9 @@ struct JSContext {
     int interrupt_counter;
 
     struct list_head loaded_modules; /* list of JSModuleDef.link */
+    uint64_t module_resolve_epoch_next;
+    uint64_t module_resolve_active_epoch;
+    int module_resolve_depth;
 
     /* if NULL, RegExp compilation is not supported */
     JSValue (*compile_regexp)(JSContext *ctx, JSValueConst pattern,
@@ -1184,6 +1187,7 @@ typedef struct JSExportEntry {
         int req_module_idx; /* module for indirect export */
     } u;
     JSExportTypeEnum export_type;
+    bool runtime_defined; /* binding created by JS_DefineModuleExport */
     JSAtom local_name; /* '*' if export ns from. not used for local
                           export after compilation */
     JSAtom export_name; /* exported variable name */
@@ -1209,6 +1213,11 @@ typedef enum {
 } JSModuleStatus;
 
 struct JSModuleDef {
+    /* The creating context owns the initial ref and releases the module's
+       contents at teardown.  External JS_TAG_MODULE handles may keep the
+       allocation itself alive as an expired shell after owner_ctx is gone. */
+    JSContext *owner_ctx;
+    JSRuntime *owner_rt;
     JSAtom module_name;
     struct list_head link;
 
@@ -1234,11 +1243,19 @@ struct JSModuleDef {
     JSValue attributes;
 
     JSValue module_ns;
+    /* Ordinary GC token used by async callbacks to find this context-owned
+       module without retaining a raw JS_TAG_MODULE pointer. */
+    JSValue callback_token;
     JSValue func_obj; /* only used for JS modules */
     JSModuleInitFunc *init_func; /* only used for C modules */
     bool has_tla; /* true if func_obj contains await */
+    bool resolving;
     bool resolved;
+    uint64_t resolve_epoch;
+    bool func_initialized;
+    bool func_creating;
     bool func_created;
+    bool mutable_namespace;
     JSModuleStatus status : 8;
     /* temp use during js_module_link() & js_module_evaluate() */
     int dfs_index, dfs_ancestor_index;
@@ -1860,11 +1877,24 @@ static JSValue js_dup(JSValueConst v)
 
 JSValue JS_DupValue(JSContext *ctx, JSValueConst v)
 {
+    if (JS_VALUE_GET_TAG(v) == JS_TAG_MODULE) {
+        JSModuleDef *m = JS_VALUE_GET_PTR(v);
+        /* Module handles never cross runtimes.  Return a borrowed value for
+           mismatched runtimes so its matching foreign free is also a no-op;
+           public module APIs will reject it without touching module state. */
+        if (!m || m->owner_rt != ctx->rt)
+            return unsafe_unconst(v);
+    }
     return js_dup(v);
 }
 
 JSValue JS_DupValueRT(JSRuntime *rt, JSValueConst v)
 {
+    if (JS_VALUE_GET_TAG(v) == JS_TAG_MODULE) {
+        JSModuleDef *m = JS_VALUE_GET_PTR(v);
+        if (!m || m->owner_rt != rt)
+            return unsafe_unconst(v);
+    }
     return js_dup(v);
 }
 
@@ -3487,21 +3517,12 @@ JSValue JS_EvalInStackFrame(JSContext *ctx, int level,
     return ret;
 }
 
-typedef enum JSFreeModuleEnum {
-    JS_FREE_MODULE_ALL,
-    JS_FREE_MODULE_NOT_RESOLVED,
-} JSFreeModuleEnum;
-
-/* XXX: would be more efficient with separate module lists */
-static void js_free_modules(JSContext *ctx, JSFreeModuleEnum flag)
+static void js_free_modules(JSContext *ctx)
 {
     struct list_head *el, *el1;
     list_for_each_safe(el, el1, &ctx->loaded_modules) {
         JSModuleDef *m = list_entry(el, JSModuleDef, link);
-        if (flag == JS_FREE_MODULE_ALL ||
-            (flag == JS_FREE_MODULE_NOT_RESOLVED && !m->resolved)) {
-            js_free_module_def(ctx, m);
-        }
+        js_free_module_def(ctx, m);
     }
 }
 
@@ -3605,7 +3626,7 @@ void JS_FreeContext(JSContext *ctx)
     }
 #endif
 
-    js_free_modules(ctx, JS_FREE_MODULE_ALL);
+    js_free_modules(ctx);
 
     JS_FreeValue(ctx, ctx->global_obj);
     JS_FreeValue(ctx, ctx->global_var_obj);
@@ -7095,6 +7116,7 @@ JSValue JS_NewCFunction2(JSContext *ctx, JSCFunction *func,
 
 typedef struct JSCFunctionDataRecord {
     JSCFunctionData *func;
+    JSContext *realm;
     uint8_t length;
     uint8_t data_len;
     uint16_t magic;
@@ -7110,6 +7132,7 @@ static void js_c_function_data_finalizer(JSRuntime *rt, JSValueConst val)
         for(i = 0; i < s->data_len; i++) {
             JS_FreeValueRT(rt, s->data[i]);
         }
+        JS_FreeContext(s->realm);
         js_free_rt(rt, s);
     }
 }
@@ -7124,6 +7147,10 @@ static void js_c_function_data_mark(JSRuntime *rt, JSValueConst val,
         for(i = 0; i < s->data_len; i++) {
             JS_MarkValue(rt, s->data[i], mark_func);
         }
+        /* Keep the creating realm alive while permitting the function and
+           realm to be collected as a cycle. JS_MarkContext will be reached
+           when the context GC object itself is traversed. */
+        mark_func(rt, &s->realm->header);
     }
 }
 
@@ -7158,11 +7185,12 @@ static JSValue js_call_c_function_data(JSContext *ctx, JSValueConst func_obj,
     prev_sf = rt->current_stack_frame;
     sf->prev_frame = prev_sf;
     rt->current_stack_frame = sf;
-    // TODO(bnoordhuis) switch realms like js_call_c_function does
+    ctx = s->realm;
     sf->is_strict_mode = false;
     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
     sf->cur_func = unsafe_unconst(func_obj);
-    sf->arg_count = argc;
+    sf->arg_count = max_int(argc, arg_count);
+    sf->arg_buf = (JSValue *)arg_buf;
     ret = s->func(ctx, this_val, argc, arg_buf, s->magic, vc(s->data));
     rt->current_stack_frame = sf->prev_frame;
     return ret;
@@ -7178,6 +7206,18 @@ JSValue JS_NewCFunctionData2(JSContext *ctx, JSCFunctionData *func,
     JSValue func_obj;
     int i;
 
+    /* JS_TAG_MODULE is an internal, context-owned handle rather than a GC
+       value. Keeping one in a function-data closure can outlive the module or
+       form a context self-cycle, so reject it instead of accepting a dangling
+       pseudo-value. Internal users must capture a normal GC value such as the
+       linked module namespace. */
+    for(i = 0; i < data_len; i++) {
+        if (JS_VALUE_GET_TAG(data[i]) == JS_TAG_MODULE) {
+            return JS_ThrowTypeError(ctx,
+                                     "cannot capture an internal module value");
+        }
+    }
+
     func_obj = JS_NewObjectProtoClass(ctx, ctx->function_proto,
                                       JS_CLASS_C_FUNCTION_DATA);
     if (JS_IsException(func_obj))
@@ -7188,11 +7228,13 @@ JSValue JS_NewCFunctionData2(JSContext *ctx, JSCFunctionData *func,
         return JS_EXCEPTION;
     }
     s->func = func;
+    s->realm = JS_DupContext(ctx);
     s->length = length;
     s->data_len = data_len;
     s->magic = magic;
-    for(i = 0; i < data_len; i++)
+    for(i = 0; i < data_len; i++) {
         s->data[i] = js_dup(data[i]);
+    }
     JS_SetOpaqueInternal(func_obj, s);
     name_atom = JS_ATOM_empty_string;
     if (name && *name) {
@@ -7707,7 +7749,14 @@ static void js_free_value_rt(JSRuntime *rt, JSValue v)
         }
         break;
     case JS_TAG_MODULE:
-        abort(); /* never freed here */
+        {
+            JSModuleDef *m = JS_VALUE_GET_PTR(v);
+            /* The context-owned reference must be the last reference while
+               the module is active.  Once context teardown expires it, the
+               final external handle owns only this resource-free shell. */
+            assert(m->owner_ctx == NULL);
+            js_free_rt(rt, m);
+        }
         break;
     case JS_TAG_BIG_INT:
         {
@@ -7731,6 +7780,13 @@ void JS_FreeValueRT(JSRuntime *rt, JSValue v)
 {
     if (JS_VALUE_HAS_REF_COUNT(v)) {
         void *p = JS_VALUE_GET_PTR(v);
+        if (JS_VALUE_GET_TAG(v) == JS_TAG_MODULE) {
+            JSModuleDef *m = p;
+            /* A foreign runtime cannot free memory allocated by owner_rt.
+               JS_DupValue[RT] likewise treats such a value as borrowed. */
+            if (!m || m->owner_rt != rt)
+                return;
+        }
         if (--JS_REF_COUNT(p) <= 0) {
             js_free_value_rt(rt, v);
         }
@@ -21937,6 +21993,12 @@ static JSContext *JS_GetFunctionRealm(JSContext *ctx, JSValueConst func_obj)
     case JS_CLASS_C_FUNCTION:
         realm = p->u.cfunc.realm;
         break;
+    case JS_CLASS_C_FUNCTION_DATA:
+        {
+            JSCFunctionDataRecord *s = p->u.c_function_data_record;
+            realm = s ? s->realm : ctx;
+        }
+        break;
     case JS_CLASS_BYTECODE_FUNCTION:
     case JS_CLASS_GENERATOR_FUNCTION:
     case JS_CLASS_ASYNC_FUNCTION:
@@ -31276,8 +31338,11 @@ static JSModuleDef *js_new_module_def(JSContext *ctx, JSAtom name)
         return NULL;
     }
     JS_REF_COUNT(m) = 1;
+    m->owner_ctx = ctx;
+    m->owner_rt = ctx->rt;
     m->module_name = name;
     m->module_ns = JS_UNDEFINED;
+    m->callback_token = JS_UNDEFINED;
     m->func_obj = JS_UNDEFINED;
     m->eval_exception = JS_UNDEFINED;
     m->meta_obj = JS_UNDEFINED;
@@ -31309,6 +31374,7 @@ static void js_mark_module_def(JSRuntime *rt, JSModuleDef *m,
     }
 
     JS_MarkValue(rt, m->module_ns, mark_func);
+    JS_MarkValue(rt, m->callback_token, mark_func);
     JS_MarkValue(rt, m->func_obj, mark_func);
     JS_MarkValue(rt, m->eval_exception, mark_func);
     JS_MarkValue(rt, m->meta_obj, mark_func);
@@ -31322,6 +31388,15 @@ static void js_mark_module_def(JSRuntime *rt, JSModuleDef *m,
 static void js_free_module_def(JSContext *ctx, JSModuleDef *m)
 {
     int i;
+    JSRuntime *owner_rt;
+
+    assert(m->owner_ctx == ctx);
+    assert(m->owner_rt == ctx->rt);
+    owner_rt = m->owner_rt;
+    /* Invalidate public access before releasing contained values: native
+       finalizers can re-enter the API while the context is being destroyed. */
+    m->owner_ctx = NULL;
+    list_del(&m->link);
 
     JS_FreeAtom(ctx, m->module_name);
 
@@ -31351,6 +31426,7 @@ static void js_free_module_def(JSContext *ctx, JSModuleDef *m)
     js_free(ctx, m->async_parent_modules);
 
     JS_FreeValue(ctx, m->module_ns);
+    JS_FreeValue(ctx, m->callback_token);
     JS_FreeValue(ctx, m->func_obj);
     JS_FreeValue(ctx, m->eval_exception);
     JS_FreeValue(ctx, m->meta_obj);
@@ -31359,8 +31435,26 @@ static void js_free_module_def(JSContext *ctx, JSModuleDef *m)
     JS_FreeValue(ctx, m->resolving_funcs[1]);
     JS_FreeValue(ctx, m->private_value);
     JS_FreeValue(ctx, m->attributes);
-    list_del(&m->link);
-    js_free(ctx, m);
+    /* Make the expired allocation an inert shell.  JS_REF_COUNT lives in the
+       allocator header, outside JSModuleDef, so clearing the definition does
+       not affect outstanding handle accounting.  Only owner_rt is retained
+       to reject foreign-runtime Dup/Free without using the wrong allocator. */
+    memset(m, 0, sizeof(*m));
+    m->owner_rt = owner_rt;
+    m->module_ns = JS_UNDEFINED;
+    m->callback_token = JS_UNDEFINED;
+    m->func_obj = JS_UNDEFINED;
+    m->eval_exception = JS_UNDEFINED;
+    m->meta_obj = JS_UNDEFINED;
+    m->promise = JS_UNDEFINED;
+    m->resolving_funcs[0] = JS_UNDEFINED;
+    m->resolving_funcs[1] = JS_UNDEFINED;
+    m->private_value = JS_UNDEFINED;
+    m->attributes = JS_UNDEFINED;
+    /* Drop the context/list reference last.  Do not access m afterwards: an
+       unexposed module is freed here, while external handles retain only the
+       expired shell until their final origin-runtime free. */
+    JS_FreeValueRT(owner_rt, JS_MKPTR(JS_TAG_MODULE, m));
 }
 
 #ifndef QJS_DISABLE_PARSER
@@ -31487,6 +31581,20 @@ JSModuleDef *JS_NewCModule(JSContext *ctx, const char *name_str,
     return m;
 }
 
+static int js_dynamic_module_init(JSContext *ctx, JSModuleDef *m)
+{
+    return 0;
+}
+
+static int js_check_module_owner(JSContext *ctx, const JSModuleDef *m)
+{
+    if (!m || m->owner_rt != ctx->rt || m->owner_ctx != ctx) {
+        JS_ThrowTypeError(ctx, "module belongs to another context");
+        return -1;
+    }
+    return 0;
+}
+
 /* `name_str` may be pure ASCII or UTF-8 encoded */
 JSModuleDef *JS_NewCModule2(JSContext *ctx, const char *name_str)
 {
@@ -31498,10 +31606,15 @@ JSModuleDef *JS_NewCModule2(JSContext *ctx, const char *name_str)
     m = js_new_module_def(ctx, name);
     if (!m)
         return NULL;
-    m->init_func = (void*)0xffff;			// non-NULL = CModule
-	m->status = JS_MODULE_STATUS_EVALUATED;	// skip init_func executing
-	m->cycle_root = m;
-	m->module_ns = JS_NewObjectProto(ctx, JS_NULL);
+    m->init_func = js_dynamic_module_init;
+    m->mutable_namespace = true;
+    m->status = JS_MODULE_STATUS_EVALUATED;
+    m->cycle_root = m;
+    m->module_ns = JS_NewObjectProto(ctx, JS_NULL);
+    if (JS_IsException(m->module_ns)) {
+        js_free_module_def(ctx, m);
+        return NULL;
+    }
 
 	return m;
 }
@@ -31511,6 +31624,8 @@ int JS_AddModuleExport(JSContext *ctx, JSModuleDef *m, const char *export_name)
 {
     JSExportEntry *me;
     JSAtom name;
+    if (js_check_module_owner(ctx, m) < 0)
+        return -1;
     name = JS_NewAtom(ctx, export_name);
     if (name == JS_ATOM_NULL)
         return -1;
@@ -31529,6 +31644,8 @@ int JS_SetModuleExport(JSContext *ctx, JSModuleDef *m, const char *export_name,
 {
     JSExportEntry *me;
     JSAtom name;
+    if (js_check_module_owner(ctx, m) < 0)
+        goto fail;
     name = JS_NewAtom(ctx, export_name);
     if (name == JS_ATOM_NULL)
         goto fail;
@@ -31585,12 +31702,18 @@ void JS_SetModuleNormalizeFunc2(JSRuntime *rt,
 
 int JS_SetModulePrivateValue(JSContext *ctx, JSModuleDef *m, JSValue val)
 {
+    if (js_check_module_owner(ctx, m) < 0) {
+        JS_FreeValue(ctx, val);
+        return -1;
+    }
     set_value(ctx, &m->private_value, val);
     return 0;
 }
 
 JSValue JS_GetModulePrivateValue(JSContext *ctx, JSModuleDef *m)
 {
+    if (js_check_module_owner(ctx, m) < 0)
+        return JS_EXCEPTION;
     return js_dup(m->private_value);
 }
 
@@ -31818,6 +31941,11 @@ static JSModuleDef *js_host_resolve_imported_module(JSContext *ctx,
     } else {
         m = rt->u.module_loader_func(ctx, cname, rt->module_loader_opaque);
     }
+    if (m && m->owner_ctx != ctx) {
+        JS_ThrowTypeError(ctx,
+                          "module loader returned a module from another context");
+        m = NULL;
+    }
     /* remember the attributes the module was requested with so that
        js_find_loaded_module() can tell apart e.g. a text module and a
        JS module with the same name */
@@ -32003,6 +32131,8 @@ static JSVarRef *js_get_local_export_var_ref1(JSContext *ctx, JSModuleDef *m,
     int i;
 
     if (!var_ref) {
+        if (!m->func_initialized)
+            return NULL;
         JSObject *p = JS_VALUE_GET_OBJ(m->func_obj);
         var_ref = p->u.func.var_refs[me->u.local.var_idx];
     }
@@ -32321,6 +32451,16 @@ static JSValue js_build_module_ns(JSContext *ctx, JSModuleDef *m)
 
 JSValue JS_GetModuleNamespace(JSContext *ctx, JSModuleDef *m)
 {
+    if (js_check_module_owner(ctx, m) < 0)
+        return JS_EXCEPTION;
+    /* A source module's namespace export set becomes stable at linking.  In
+       particular, building a namespace through an export-star facade before
+       then would freeze a stale set while JS_DefineModuleExport can still add
+       runtime names to the provider. */
+    if (!m->init_func && m->status == JS_MODULE_STATUS_UNLINKED) {
+        return JS_ThrowTypeError(ctx,
+                                 "module must be linked before its namespace is accessed");
+    }
     if (JS_IsUndefined(m->module_ns)) {
         JSValue val;
         val = js_build_module_ns(ctx, m);
@@ -32341,36 +32481,96 @@ JSValue JS_GetModuleNamespace(JSContext *ctx, JSModuleDef *m)
 #define module_trace(...)
 #endif
 
-/* Load all the required modules for module 'm' */
-static int js_resolve_module(JSContext *ctx, JSModuleDef *m)
+/* Resolve one graph transaction. Modules completed by a transaction retain
+   its epoch until the outermost call commits, so a later failure can roll
+   back every provisional `resolved` bit, including peers completed through a
+   cycle. Loaded module objects and request edges remain cached for retry. */
+static int js_resolve_module_txn(JSContext *ctx, JSModuleDef *m,
+                                 uint64_t epoch)
 {
     int i;
     JSModuleDef *m1;
 
     if (m->resolved)
         return 0;
+    if (m->resolving) {
+        if (m->resolve_epoch == epoch)
+            return 0;
+        JS_ThrowInternalError(ctx, "module is resolving in another transaction");
+        return -1;
+    }
 #ifdef ENABLE_DUMPS // JS_DUMP_MODULE_RESOLVE
     if (check_dump_flag(ctx->rt, JS_DUMP_MODULE_RESOLVE)) {
         char buf1[ATOM_GET_STR_BUF_SIZE];
         printf("resolving module '%s':\n", JS_AtomGetStr(ctx, buf1, sizeof(buf1), m->module_name));
     }
 #endif
-    m->resolved = true;
+    m->resolving = true;
+    m->resolve_epoch = epoch;
     /* resolve each requested module */
     for(i = 0; i < m->req_module_entries_count; i++) {
         JSReqModuleEntry *rme = &m->req_module_entries[i];
-        m1 = js_host_resolve_imported_module_atom(ctx, m->module_name,
-                                                  rme->module_name,
-                                                  rme->attributes);
+        m1 = rme->module;
+        if (!m1) {
+            m1 = js_host_resolve_imported_module_atom(ctx, m->module_name,
+                                                      rme->module_name,
+                                                      rme->attributes);
+        }
         if (!m1)
-            return -1;
+            goto fail;
         rme->module = m1;
         /* already done in js_host_resolve_imported_module() except if
            the module was loaded with JS_EvalBinary() */
-        if (js_resolve_module(ctx, m1) < 0)
-            return -1;
+        if (js_resolve_module_txn(ctx, m1, epoch) < 0)
+            goto fail;
     }
+    m->resolved = true;
+    m->resolving = false;
     return 0;
+ fail:
+    m->resolving = false;
+    return -1;
+}
+
+/* Load all the required modules for module 'm'. */
+static int js_resolve_module(JSContext *ctx, JSModuleDef *m)
+{
+    struct list_head *el;
+    uint64_t epoch;
+    bool outermost;
+    int ret;
+
+    outermost = (ctx->module_resolve_depth == 0);
+    if (outermost) {
+        epoch = ++ctx->module_resolve_epoch_next;
+        if (epoch == 0)
+            epoch = ++ctx->module_resolve_epoch_next;
+        ctx->module_resolve_active_epoch = epoch;
+    } else {
+        epoch = ctx->module_resolve_active_epoch;
+    }
+    ctx->module_resolve_depth++;
+    ret = js_resolve_module_txn(ctx, m, epoch);
+    ctx->module_resolve_depth--;
+
+    if (outermost) {
+        list_for_each(el, &ctx->loaded_modules) {
+            JSModuleDef *m1 = list_entry(el, JSModuleDef, link);
+            if (m1->resolve_epoch == epoch) {
+                m1->resolving = false;
+                /* A loader may re-enter public evaluation and completely
+                   link/evaluate a module before the outer resolve later
+                   fails.  Such a module committed its own graph and must not
+                   become EVALUATED-but-unresolved.  Only provisional,
+                   still-unlinked results belong to the failed transaction. */
+                if (ret < 0 && m1->status == JS_MODULE_STATUS_UNLINKED)
+                    m1->resolved = false;
+                m1->resolve_epoch = 0;
+            }
+        }
+        ctx->module_resolve_active_epoch = 0;
+    }
+    return ret;
 }
 
 static JSVarRef *js_create_module_var(JSContext *ctx, bool is_lexical)
@@ -32450,37 +32650,72 @@ static int js_create_module_function(JSContext *ctx, JSModuleDef *m)
     int i;
     JSVarRef *var_ref;
 
-    if (m->func_created)
+    if (!m) {
+        JS_ThrowInternalError(ctx, "module dependency was not resolved");
+        return -1;
+    }
+    /* func_created is only a completed-pass marker.  A later pass may start
+       at another member of a cycle after an earlier ancestor failed, so it
+       must still walk the dependency graph.  func_initialized keeps the
+       bytecode-to-closure conversion one-shot; func_creating breaks cycles. */
+    if (m->func_creating)
         return 0;
 
     is_c_module = (m->init_func != NULL);
 
-    if (is_c_module) {
-        /* initialize the exported variables */
-        for(i = 0; i < m->export_entries_count; i++) {
-            JSExportEntry *me = &m->export_entries[i];
-            if (me->export_type == JS_EXPORT_TYPE_LOCAL && !me->u.local.var_ref) {
-                var_ref = js_create_module_var(ctx, false);
-                if (!var_ref)
-                    return -1;
-                me->u.local.var_ref = var_ref;
+    if (!m->func_initialized) {
+        if (is_c_module) {
+            /* initialize the exported variables */
+            for(i = 0; i < m->export_entries_count; i++) {
+                JSExportEntry *me = &m->export_entries[i];
+                if (me->export_type == JS_EXPORT_TYPE_LOCAL && !me->u.local.var_ref) {
+                    var_ref = js_create_module_var(ctx, false);
+                    if (!var_ref)
+                        return -1;
+                    me->u.local.var_ref = var_ref;
+                }
             }
+        } else {
+            if (js_create_module_bytecode_function(ctx, m))
+                return -1;
         }
-    } else {
-        if (js_create_module_bytecode_function(ctx, m))
-            return -1;
+        m->func_initialized = true;
     }
-    m->func_created = true;
+    m->func_creating = true;
 
     /* do it on the dependencies */
 
     for(i = 0; i < m->req_module_entries_count; i++) {
         JSReqModuleEntry *rme = &m->req_module_entries[i];
+        if (!rme->module) {
+            /* A host loader is allowed to evaluate the module it is about to
+               return.  In a cycle, the outer js_resolve_module() has already
+               marked the peer resolved but has not yet assigned this request
+               slot.  Resolve through the normal host path: its loaded-module
+               lookup closes the in-flight cycle without invoking the loader
+               again, and also applies relative-name normalization. */
+            rme->module = js_host_resolve_imported_module_atom(
+                ctx, m->module_name, rme->module_name, rme->attributes);
+            if (!rme->module) {
+                if (!JS_HasException(ctx)) {
+                    char buf[ATOM_GET_STR_BUF_SIZE];
+                    JS_ThrowReferenceError(ctx, "module dependency '%s' is not loaded",
+                                           JS_AtomGetStr(ctx, buf, sizeof(buf),
+                                                         rme->module_name));
+                }
+                goto fail;
+            }
+        }
         if (js_create_module_function(ctx, rme->module) < 0)
-            return -1;
+            goto fail;
     }
 
+    m->func_creating = false;
+    m->func_created = true;
     return 0;
+ fail:
+    m->func_creating = false;
+    return -1;
 }
 
 
@@ -32609,6 +32844,9 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
                 val = JS_GetModuleNamespace(ctx, m1);
                 if (JS_IsException(val))
                     goto fail;
+                /* Linking can be retried after another import/export fails.
+                   Release the previous tentative binding before replacing it
+                   so each closure slot owns exactly one reference. */
                 set_value(ctx, &var_refs[mi->var_idx]->value, val);
 
                 module_trace(ctx, "namespace\n");
@@ -32638,6 +32876,7 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
                         goto fail;
                     }
                     set_value(ctx, &var_ref->value, val);
+                    free_var_ref(ctx->rt, var_refs[mi->var_idx]);
                     var_refs[mi->var_idx] = var_ref;
 
                     module_trace(ctx, "namespace from\n");
@@ -32656,6 +32895,7 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
                         goto fail;
                     }
                     JS_REF_COUNT(var_ref)++;
+                    free_var_ref(ctx->rt, var_refs[mi->var_idx]);
                     var_refs[mi->var_idx] = var_ref;
 
                     module_trace(ctx, "local export (var_ref=%p)\n", (void *)var_ref);
@@ -32668,9 +32908,19 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
            initialized before in case imports are exported) */
         for(i = 0; i < m->export_entries_count; i++) {
             JSExportEntry *me = &m->export_entries[i];
-            if (me->export_type == JS_EXPORT_TYPE_LOCAL) {
+            if (me->export_type == JS_EXPORT_TYPE_LOCAL &&
+                !me->runtime_defined) {
                 var_ref = var_refs[me->u.local.var_idx];
+                if (!var_ref) {
+                    char buf[ATOM_GET_STR_BUF_SIZE];
+                    JS_ThrowSyntaxError(ctx,
+                        "export binding '%s' is not resolvable",
+                        JS_AtomGetStr(ctx, buf, sizeof(buf),
+                                      me->export_name));
+                    goto fail;
+                }
                 JS_REF_COUNT(var_ref)++;
+                free_var_ref(ctx->rt, me->u.local.var_ref);
                 me->u.local.var_ref = var_ref;
             }
         }
@@ -32740,24 +32990,83 @@ static int js_link_module(JSContext *ctx, JSModuleDef *m)
 void* JS_DefineModuleExport(JSContext *ctx, JSModuleDef *m, JSAtom name, JSValue val)
 {
     JSExportEntry *me;
-	
-	// find repeated element
-	me = find_export_entry(ctx, m, name);
-	if(!me) me = add_export_entry2(ctx, NULL, m, name, name, JS_EXPORT_TYPE_LOCAL);
+    JSVarRef *var_ref;
+    bool is_new;
 
-	// create
-	if(!me->u.local.var_ref)
-		me->u.local.var_ref = js_create_module_var(ctx, false);
-    set_value(ctx, me->u.local.var_ref->pvalue, val);
+    if (js_check_module_owner(ctx, m) < 0) {
+        JS_FreeValue(ctx, val);
+        return NULL;
+    }
 
-	// also link to nd
-	JS_DefinePropertyValue(ctx, m->module_ns, name, js_dup(val), JS_PROP_C_W_E);
+    me = find_export_entry(ctx, m, name);
+    is_new = (me == NULL);
+    if (me && me->export_type != JS_EXPORT_TYPE_LOCAL) {
+        JS_FreeValue(ctx, val);
+        JS_ThrowTypeError(ctx, "cannot replace a statically declared export");
+        return NULL;
+    }
+    if (me && !m->init_func && !me->runtime_defined) {
+        JS_FreeValue(ctx, val);
+        JS_ThrowTypeError(ctx, "cannot replace a statically declared export");
+        return NULL;
+    }
+    if (is_new && !m->mutable_namespace &&
+        (!JS_IsUndefined(m->module_ns) ||
+         m->status != JS_MODULE_STATUS_UNLINKED)) {
+        JS_FreeValue(ctx, val);
+        JS_ThrowTypeError(ctx,
+                          "cannot add an export after the module namespace is created or linked");
+        return NULL;
+    }
+    if (!me) {
+        me = add_export_entry2(ctx, NULL, m, JS_ATOM_NULL, name,
+                               JS_EXPORT_TYPE_LOCAL);
+        if (!me) {
+            JS_FreeValue(ctx, val);
+            return NULL;
+        }
+        me->runtime_defined = true;
+    }
 
-    return me->u.local.var_ref;
+    var_ref = me->u.local.var_ref;
+    if (!var_ref) {
+        var_ref = js_create_module_var(ctx, false);
+        if (!var_ref) {
+            JS_FreeValue(ctx, val);
+            if (is_new) {
+                JS_FreeAtom(ctx, me->export_name);
+                JS_FreeAtom(ctx, me->local_name);
+                m->export_entries_count--;
+            }
+            return NULL;
+        }
+        me->u.local.var_ref = var_ref;
+    }
+    if (m->mutable_namespace) {
+        /* JS_NewCModule2 has an ordinary, extensible namespace.  Replace an
+           existing property instead of defining a second binding. */
+        if (JS_DefinePropertyValue(ctx, m->module_ns, name,
+                                   js_dup(val), JS_PROP_C_W_E) < 0) {
+            JS_FreeValue(ctx, val);
+            if (is_new) {
+                free_var_ref(ctx->rt, var_ref);
+                JS_FreeAtom(ctx, me->export_name);
+                JS_FreeAtom(ctx, me->local_name);
+                m->export_entries_count--;
+            }
+            return NULL;
+        }
+    }
+    set_value(ctx, var_ref->pvalue, val);
+
+    return var_ref;
 }
 
 void JS_FreeModuleExport(JSRuntime* rt, void* module_var) {
-	free_var_ref(rt, module_var);
+    /* Kept for ABI compatibility.  Export var_refs belong to JSModuleDef and
+       freeing one independently leaves the module with a dangling pointer. */
+    (void)rt;
+    (void)module_var;
 }
 
 /* return JS_ATOM_NULL if the name cannot be found. Only works with
@@ -32789,12 +33098,16 @@ JSAtom JS_GetScriptOrModuleName(JSContext *ctx, int n_stack_levels)
 
 JSAtom JS_GetModuleName(JSContext *ctx, JSModuleDef *m)
 {
+    if (js_check_module_owner(ctx, m) < 0)
+        return JS_ATOM_NULL;
     return JS_DupAtom(ctx, m->module_name);
 }
 
 JSValue JS_GetImportMeta(JSContext *ctx, JSModuleDef *m)
 {
     JSValue obj;
+    if (js_check_module_owner(ctx, m) < 0)
+        return JS_EXCEPTION;
     /* allocate meta_obj only if requested to save memory */
     obj = m->meta_obj;
     if (JS_IsUndefined(obj)) {
@@ -32829,8 +33142,11 @@ static JSValue js_import_meta(JSContext *ctx)
 
 static JSValue JS_NewModuleValue(JSContext *ctx, JSModuleDef *m)
 {
-    return js_dup(JS_MKPTR(JS_TAG_MODULE, m));
+    assert(m->owner_ctx == ctx);
+    return JS_DupValue(ctx, JS_MKPTR(JS_TAG_MODULE, m));
 }
+
+static void js_promise_set_handled(JSContext *ctx, JSValueConst promise);
 
 static JSValue js_load_module_rejected(JSContext *ctx, JSValueConst this_val,
                                        int argc, JSValueConst *argv, int magic,
@@ -32855,16 +33171,11 @@ static JSValue js_load_module_fulfilled(JSContext *ctx, JSValueConst this_val,
                                         JSValueConst *func_data)
 {
     JSValueConst *resolving_funcs = func_data;
-    JSModuleDef *m = JS_VALUE_GET_PTR(func_data[2]);
-    JSValue ret, ns;
+    JSValue ret, ns = js_dup(func_data[2]);
 
-    /* return the module namespace */
-    ns = JS_GetModuleNamespace(ctx, m);
-    if (JS_IsException(ns)) {
-        JSValue err = JS_GetException(ctx);
-        js_load_module_rejected(ctx, JS_UNDEFINED, 1, vc(&err), 0, func_data);
-        return JS_UNDEFINED;
-    }
+    /* The linked namespace is captured as an ordinary GC value. Capturing the
+       context-owned JS_TAG_MODULE handle here used to permit a teardown UAF;
+       pinning its context instead created an uncollectable self-cycle. */
     ret = JS_Call(ctx, resolving_funcs[0], JS_UNDEFINED, 1, vc(&ns));
     JS_FreeValue(ctx, ret);
     JS_FreeValue(ctx, ns);
@@ -32876,9 +33187,10 @@ static void JS_LoadModuleInternal(JSContext *ctx, const char *basename,
                                   JSValueConst *resolving_funcs,
                                   JSValueConst attributes)
 {
-    JSValue evaluate_promise;
+    JSValue evaluate_promise = JS_UNDEFINED, ns = JS_UNDEFINED;
     JSModuleDef *m;
-    JSValue ret, err, func_obj, evaluate_resolving_funcs[2];
+    JSValue ret, err, func_obj;
+    JSValue evaluate_resolving_funcs[2] = { JS_UNDEFINED, JS_UNDEFINED };
     JSValueConst func_data[3];
 
     m = js_host_resolve_imported_module(ctx, basename, filename, attributes);
@@ -32886,34 +33198,57 @@ static void JS_LoadModuleInternal(JSContext *ctx, const char *basename,
         goto fail;
 
     if (js_resolve_module(ctx, m) < 0) {
-        js_free_modules(ctx, JS_FREE_MODULE_NOT_RESOLVED);
         goto fail;
     }
 
     /* Evaluate the module code */
     func_obj = JS_NewModuleValue(ctx, m);
     evaluate_promise = JS_EvalFunction(ctx, func_obj);
-    if (JS_IsException(evaluate_promise)) {
-    fail:
-        err = JS_GetException(ctx);
-        ret = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
-        JS_FreeValue(ctx, ret); /* XXX: what to do if exception ? */
-        JS_FreeValue(ctx, err);
-        return;
-    }
+    if (JS_IsException(evaluate_promise))
+        goto fail;
 
-    func_obj = JS_NewModuleValue(ctx, m);
+    ns = JS_GetModuleNamespace(ctx, m);
+    if (JS_IsException(ns))
+        goto fail;
+
     func_data[0] = resolving_funcs[0];
     func_data[1] = resolving_funcs[1];
-    func_data[2] = func_obj;
+    func_data[2] = ns;
     evaluate_resolving_funcs[0] = JS_NewCFunctionData(ctx, js_load_module_fulfilled, 0, 0, 3, func_data);
+    if (JS_IsException(evaluate_resolving_funcs[0]))
+        goto fail;
     evaluate_resolving_funcs[1] = JS_NewCFunctionData(ctx, js_load_module_rejected, 0, 0, 3, func_data);
-    JS_FreeValue(ctx, func_obj);
+    if (JS_IsException(evaluate_resolving_funcs[1]))
+        goto fail;
     ret = js_promise_then(ctx, evaluate_promise, 2, vc(evaluate_resolving_funcs));
+    if (JS_IsException(ret))
+        goto fail;
     JS_FreeValue(ctx, ret);
+    JS_FreeValue(ctx, ns);
     JS_FreeValue(ctx, evaluate_resolving_funcs[0]);
     JS_FreeValue(ctx, evaluate_resolving_funcs[1]);
     JS_FreeValue(ctx, evaluate_promise);
+    return;
+
+ fail:
+    err = JS_GetException(ctx);
+    if (JS_IsPromise(evaluate_promise))
+        js_promise_set_handled(ctx, evaluate_promise);
+    JS_FreeValue(ctx, ns);
+    JS_FreeValue(ctx, evaluate_resolving_funcs[0]);
+    JS_FreeValue(ctx, evaluate_resolving_funcs[1]);
+    JS_FreeValue(ctx, evaluate_promise);
+    ret = JS_Call(ctx, resolving_funcs[1], JS_UNDEFINED, 1, vc(&err));
+    JS_FreeValue(ctx, err);
+    if (JS_IsException(ret)) {
+        /* This API reports loading failures through its returned promise.
+           Consume a secondary reject-callback error instead of leaving an
+           unrelated pending exception on the context. */
+        err = JS_GetException(ctx);
+        JS_FreeValue(ctx, err);
+    } else {
+        JS_FreeValue(ctx, ret);
+    }
 }
 
 /* Return a promise or an exception in case of memory error. */
@@ -33200,14 +33535,38 @@ static int exec_module_list_cmp(const void *p1, const void *p2, void *opaque)
 static int js_execute_async_module(JSContext *ctx, JSModuleDef *m);
 static int js_execute_sync_module(JSContext *ctx, JSModuleDef *m,
                                   JSValue *pvalue);
-static void js_promise_set_handled(JSContext *ctx, JSValueConst promise);
 
-static JSValue js_async_module_execution_rejected(JSContext *ctx, JSValueConst this_val,
-                                                  int argc, JSValueConst *argv, int magic,
-                                                  JSValueConst *func_data)
+static JSValue js_get_module_callback_token(JSContext *ctx, JSModuleDef *m)
 {
-    JSModuleDef *module = JS_VALUE_GET_PTR(func_data[0]);
-    JSValueConst error = argv[0];
+    if (JS_IsUndefined(m->callback_token)) {
+        JSValue token = JS_NewObjectProto(ctx, JS_NULL);
+        if (JS_IsException(token))
+            return token;
+        m->callback_token = token;
+    }
+    return js_dup(m->callback_token);
+}
+
+static JSModuleDef *js_find_module_by_callback_token(JSContext *ctx,
+                                                      JSValueConst token)
+{
+    struct list_head *el;
+
+    if (!JS_IsObject(token))
+        return NULL;
+    list_for_each(el, &ctx->loaded_modules) {
+        JSModuleDef *m = list_entry(el, JSModuleDef, link);
+        if (JS_IsObject(m->callback_token) &&
+            JS_VALUE_GET_OBJ(m->callback_token) == JS_VALUE_GET_OBJ(token)) {
+            return m;
+        }
+    }
+    return NULL;
+}
+
+static JSValue js_async_module_execution_rejected_internal(
+    JSContext *ctx, JSModuleDef *module, JSValueConst error)
+{
     int i;
 
     if (js_check_stack_overflow(ctx->rt, 0))
@@ -33228,10 +33587,10 @@ static JSValue js_async_module_execution_rejected(JSContext *ctx, JSValueConst t
 
     for(i = 0; i < module->async_parent_modules_count; i++) {
         JSModuleDef *m = module->async_parent_modules[i];
-        JSValue m_obj = JS_NewModuleValue(ctx, m);
-        js_async_module_execution_rejected(ctx, JS_UNDEFINED, 1, &error, 0,
-                                           vc(&m_obj));
-        JS_FreeValue(ctx, m_obj);
+        JSValue ret = js_async_module_execution_rejected_internal(ctx, m,
+                                                                  error);
+        if (JS_IsException(ret))
+            return ret;
     }
 
     if (!JS_IsUndefined(module->promise)) {
@@ -33244,14 +33603,33 @@ static JSValue js_async_module_execution_rejected(JSContext *ctx, JSValueConst t
     return JS_UNDEFINED;
 }
 
+static JSValue js_async_module_execution_rejected(JSContext *ctx,
+                                                  JSValueConst this_val,
+                                                  int argc,
+                                                  JSValueConst *argv,
+                                                  int magic,
+                                                  JSValueConst *func_data)
+{
+    JSModuleDef *module = js_find_module_by_callback_token(ctx, func_data[0]);
+    JSValueConst error = argc >= 1 ? argv[0] : JS_UNDEFINED;
+
+    if (!module)
+        return JS_ThrowInternalError(ctx,
+                                     "async module callback is no longer valid");
+    return js_async_module_execution_rejected_internal(ctx, module, error);
+}
+
 static JSValue js_async_module_execution_fulfilled(JSContext *ctx, JSValueConst this_val,
                                                    int argc, JSValueConst *argv, int magic,
                                                    JSValueConst *func_data)
 {
-    JSModuleDef *module = JS_VALUE_GET_PTR(func_data[0]);
+    JSModuleDef *module = js_find_module_by_callback_token(ctx, func_data[0]);
     ExecModuleList exec_list_s, *exec_list = &exec_list_s;
     int i;
 
+    if (!module)
+        return JS_ThrowInternalError(ctx,
+                                     "async module callback is no longer valid");
     if (module->status == JS_MODULE_STATUS_EVALUATED) {
         assert(module->eval_has_exception);
         return JS_UNDEFINED;
@@ -33259,17 +33637,22 @@ static JSValue js_async_module_execution_fulfilled(JSContext *ctx, JSValueConst 
     assert(module->status == JS_MODULE_STATUS_EVALUATING_ASYNC);
     assert(!module->eval_has_exception);
     assert(module->async_evaluation);
-    module->async_evaluation = false;
-    js_set_module_evaluated(ctx, module);
 
     exec_list->tab = NULL;
     exec_list->count = 0;
     exec_list->size = 0;
 
     if (gather_available_ancestors(ctx, module, exec_list) < 0) {
+        JSValue error = JS_GetException(ctx);
+        JSValue ret = js_async_module_execution_rejected_internal(
+            ctx, module, error);
+        JS_FreeValue(ctx, error);
         js_free(ctx, exec_list->tab);
-        return JS_EXCEPTION;
+        return ret;
     }
+
+    module->async_evaluation = false;
+    js_set_module_evaluated(ctx, module);
 
     /* sort by increasing async_evaluation timestamp */
     rqsort(exec_list->tab, exec_list->count, sizeof(exec_list->tab[0]),
@@ -33280,16 +33663,28 @@ static JSValue js_async_module_execution_fulfilled(JSContext *ctx, JSValueConst 
         if (m->status == JS_MODULE_STATUS_EVALUATED) {
             assert(m->eval_has_exception);
         } else if (m->has_tla) {
-            js_execute_async_module(ctx, m);
+            if (js_execute_async_module(ctx, m) < 0) {
+                JSValue error = JS_GetException(ctx);
+                JSValue ret = js_async_module_execution_rejected_internal(
+                    ctx, m, error);
+                JS_FreeValue(ctx, error);
+                if (JS_IsException(ret)) {
+                    js_free(ctx, exec_list->tab);
+                    return ret;
+                }
+                JS_FreeValue(ctx, ret);
+            }
         } else {
             JSValue error;
             if (js_execute_sync_module(ctx, m, &error) < 0) {
-                JSValue m_obj = JS_NewModuleValue(ctx, m);
-                js_async_module_execution_rejected(ctx, JS_UNDEFINED,
-                                                   1, vc(&error),
-                                                   0, vc(&m_obj));
-                JS_FreeValue(ctx, m_obj);
+                JSValue ret = js_async_module_execution_rejected_internal(
+                    ctx, m, error);
                 JS_FreeValue(ctx, error);
+                if (JS_IsException(ret)) {
+                    js_free(ctx, exec_list->tab);
+                    return ret;
+                }
+                JS_FreeValue(ctx, ret);
             } else {
                 js_set_module_evaluated(ctx, m);
             }
@@ -33301,21 +33696,40 @@ static JSValue js_async_module_execution_fulfilled(JSContext *ctx, JSValueConst 
 
 static int js_execute_async_module(JSContext *ctx, JSModuleDef *m)
 {
-    JSValue promise, m_obj;
-    JSValue resolve_funcs[2], ret_val;
+    JSValue promise = JS_UNDEFINED, token = JS_UNDEFINED;
+    JSValue resolve_funcs[2] = { JS_UNDEFINED, JS_UNDEFINED };
+    JSValue ret_val;
+
     promise = js_async_function_call(ctx, m->func_obj, JS_UNDEFINED, 0, NULL, 0);
     if (JS_IsException(promise))
-        return -1;
-    m_obj = JS_NewModuleValue(ctx, m);
-    resolve_funcs[0] = JS_NewCFunctionData(ctx, js_async_module_execution_fulfilled, 0, 0, 1, vc(&m_obj));
-    resolve_funcs[1] = JS_NewCFunctionData(ctx, js_async_module_execution_rejected, 0, 0, 1, vc(&m_obj));
+        goto fail;
+    token = js_get_module_callback_token(ctx, m);
+    if (JS_IsException(token))
+        goto fail;
+    resolve_funcs[0] = JS_NewCFunctionData(ctx, js_async_module_execution_fulfilled, 0, 0, 1, vc(&token));
+    if (JS_IsException(resolve_funcs[0]))
+        goto fail;
+    resolve_funcs[1] = JS_NewCFunctionData(ctx, js_async_module_execution_rejected, 0, 0, 1, vc(&token));
+    if (JS_IsException(resolve_funcs[1]))
+        goto fail;
     ret_val = js_promise_then(ctx, promise, 2, vc(resolve_funcs));
+    if (JS_IsException(ret_val))
+        goto fail;
     JS_FreeValue(ctx, ret_val);
-    JS_FreeValue(ctx, m_obj);
+    JS_FreeValue(ctx, token);
     JS_FreeValue(ctx, resolve_funcs[0]);
     JS_FreeValue(ctx, resolve_funcs[1]);
     JS_FreeValue(ctx, promise);
     return 0;
+
+ fail:
+    if (JS_IsPromise(promise))
+        js_promise_set_handled(ctx, promise);
+    JS_FreeValue(ctx, token);
+    JS_FreeValue(ctx, resolve_funcs[0]);
+    JS_FreeValue(ctx, resolve_funcs[1]);
+    JS_FreeValue(ctx, promise);
+    return -1;
 }
 
 /* return < 0 in case of exception. *pvalue contains the exception. */
@@ -33443,7 +33857,10 @@ static int js_inner_module_evaluation(JSContext *ctx, JSModuleDef *m,
         m->async_evaluation = true;
         m->async_evaluation_timestamp =
             ctx->rt->module_async_evaluation_next_timestamp++;
-        js_execute_async_module(ctx, m);
+        if (js_execute_async_module(ctx, m) < 0) {
+            *pvalue = JS_GetException(ctx);
+            return -1;
+        }
     } else {
         if (js_execute_sync_module(ctx, m, pvalue) < 0)
             return -1;
@@ -39293,6 +39710,10 @@ static JSValue JS_EvalFunctionInternal(JSContext *ctx, JSValue fun_obj,
     } else if (tag == JS_TAG_MODULE) {
         JSModuleDef *m;
         m = JS_VALUE_GET_PTR(fun_obj);
+        if (js_check_module_owner(ctx, m) < 0) {
+            JS_FreeValue(ctx, fun_obj);
+            return JS_EXCEPTION;
+        }
         /* the module refcount should be >= 2 */
         JS_FreeValue(ctx, fun_obj);
         if (js_create_module_function(ctx, m) < 0)
@@ -39428,8 +39849,13 @@ static JSValue __JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
     }
     return ret_val;
  fail1:
-    /* XXX: should free all the unresolved dependencies */
-    if (m)
+    /* Once bytecode creation has completed, resolving may have exposed this
+       module to a re-entrant loader or cached it in another module's request
+       table.  Keep that compiled module as an unresolved tombstone so a later
+       import can retry resolution without leaving dangling module pointers.
+       A parser/bytecode-creation failure has not published a usable module and
+       can still be freed immediately. */
+    if (m && JS_IsUndefined(m->func_obj))
         js_free_module_def(ctx, m);
     return JS_EXCEPTION;
 }
@@ -39531,8 +39957,9 @@ int JS_ResolveModule(JSContext *ctx, JSValueConst obj)
 {
     if (JS_VALUE_GET_TAG(obj) == JS_TAG_MODULE) {
         JSModuleDef *m = JS_VALUE_GET_PTR(obj);
+        if (js_check_module_owner(ctx, m) < 0)
+            return -1;
         if (js_resolve_module(ctx, m) < 0) {
-            js_free_modules(ctx, JS_FREE_MODULE_NOT_RESOLVED);
             return -1;
         }
     }
@@ -40107,8 +40534,24 @@ static int JS_WriteModule(BCWriterState *s, JSValueConst obj)
     JSModuleDef *m = JS_VALUE_GET_PTR(obj);
     int i;
 
+    if (js_check_module_owner(s->ctx, m) < 0)
+        return -1;
+    if (m->init_func) {
+        JS_ThrowTypeError(s->ctx, "cannot serialize a C module");
+        return -1;
+    }
     bc_put_u8(s, BC_TAG_MODULE);
     bc_put_atom(s, m->module_name);
+
+    for(i = 0; i < m->export_entries_count; i++) {
+        JSExportEntry *me = &m->export_entries[i];
+        if (me->export_type == JS_EXPORT_TYPE_LOCAL &&
+            me->runtime_defined) {
+            JS_ThrowTypeError(s->ctx,
+                              "cannot serialize a module with runtime-defined exports");
+            return -1;
+        }
+    }
 
     bc_put_leb128(s, m->req_module_entries_count);
     for(i = 0; i < m->req_module_entries_count; i++) {
@@ -41356,7 +41799,6 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
 static JSValue JS_ReadModule(BCReaderState *s)
 {
     JSContext *ctx = s->ctx;
-    JSValue obj;
     JSModuleDef *m = NULL;
     JSAtom module_name;
     int i;
@@ -41374,10 +41816,8 @@ static JSValue JS_ReadModule(BCReaderState *s)
     m = js_new_module_def(ctx, module_name);
     if (!m)
         goto fail;
-    obj = js_dup(JS_MKPTR(JS_TAG_MODULE, m));
     if (bc_get_leb128_int(s, &m->req_module_entries_count))
         goto fail;
-    obj = JS_NewModuleValue(ctx, m);
     if (m->req_module_entries_count != 0) {
         m->req_module_entries_size = m->req_module_entries_count;
         m->req_module_entries = js_mallocz(ctx, sizeof(m->req_module_entries[0]) * m->req_module_entries_size);
@@ -41385,22 +41825,8 @@ static JSValue JS_ReadModule(BCReaderState *s)
             goto fail;
         for(i = 0; i < m->req_module_entries_count; i++) {
             JSReqModuleEntry *rme = &m->req_module_entries[i];
-            JSModuleDef **pm = &rme->module;
             rme->attributes = JS_UNDEFINED;
             if (bc_get_atom(s, &rme->module_name))
-                goto fail;
-            // Resolves a module either from the cache or by requesting
-            // it from the module loader. From cache is not ideal because
-            // the module may not be the one it was a time of serialization
-            // but directly petitioning the module loader is not correct
-            // either because then the same module can get loaded twice.
-            // JS_WriteModule() does not serialize modules transitively
-            // because that doesn't work for C modules and is also prone
-            // to loading the same JS module twice.
-            *pm = js_host_resolve_imported_module_atom(s->ctx, m->module_name,
-                                                       rme->module_name,
-                                                       rme->attributes);
-            if (!*pm)
                 goto fail;
         }
     }
@@ -41470,10 +41896,27 @@ static JSValue JS_ReadModule(BCReaderState *s)
     m->func_obj = JS_ReadObjectRec(s);
     if (JS_IsException(m->func_obj))
         goto fail;
-    return obj;
+
+    /* Do not invoke host loaders while the bytecode module is only partially
+       initialized: a re-entrant loader can observe modules it returns and a
+       later decode failure would otherwise leave dangling graph edges.  Once
+       the module is complete, populate the same dependency cache that older
+       bytecode loading exposed before returning to the embedding. */
+    for(i = 0; i < m->req_module_entries_count; i++) {
+        JSReqModuleEntry *rme = &m->req_module_entries[i];
+        rme->module = js_host_resolve_imported_module_atom(
+            ctx, m->module_name, rme->module_name, rme->attributes);
+        if (!rme->module)
+            goto fail;
+    }
+    return JS_NewModuleValue(ctx, m);
  fail:
     if (m) {
-        js_free_module_def(ctx, m);
+        /* A complete bytecode module may have been published while resolving
+           its dependencies. Preserve it as an unresolved tombstone for the
+           same reason as a source module whose resolution failed. */
+        if (JS_IsUndefined(m->func_obj))
+            js_free_module_def(ctx, m);
     }
     return JS_EXCEPTION;
 }
@@ -58014,7 +58457,6 @@ static __exception int perform_promise_then(JSContext *ctx,
             list_add_tail(&rd_array[i]->link, &s->promise_reactions[i]);
     } else {
         JSValueConst args[5];
-        call_promise_rejection_tracker(ctx, promise, true);
         i = s->promise_state - JS_PROMISE_FULFILLED;
         rd = rd_array[i];
         args[0] = rd->resolving_funcs[0];
@@ -58022,9 +58464,14 @@ static __exception int perform_promise_then(JSContext *ctx,
         args[2] = rd->handler;
         args[3] = js_bool(i);
         args[4] = s->promise_result;
-        JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
+        if (JS_EnqueueJob(ctx, promise_reaction_job, 5, args) < 0) {
+            for(i = 0; i < 2; i++)
+                promise_reaction_data_free(ctx->rt, rd_array[i]);
+            return -1;
+        }
         for(i = 0; i < 2; i++)
             promise_reaction_data_free(ctx->rt, rd_array[i]);
+        call_promise_rejection_tracker(ctx, promise, true);
     }
     s->is_handled = true;
     return 0;
@@ -61022,19 +61469,17 @@ int JS_SetArrayBufferPinUnsupported(JSValueConst obj, bool unsupported)
     return 0;
 }
 
-int JS_DetachArrayBuffer(JSContext *ctx, JSValueConst obj)
+int JS_DetachArrayBufferRT(JSRuntime *rt, JSValueConst obj)
 {
     JSArrayBuffer *abuf = JS_GetOpaque(obj, JS_CLASS_ARRAY_BUFFER);
     struct list_head *el;
 
     if (!abuf || abuf->detached)
         return 0;
-    if (abuf->pin_count != 0) {
-        JS_ThrowTypeErrorPinnedArrayBuffer(ctx);
+    if (abuf->pin_count != 0)
         return -1;
-    }
     if (abuf->realloc_func) {
-        abuf->realloc_func(ctx->rt, abuf->opaque, abuf->data, 0);
+        abuf->realloc_func(rt, abuf->opaque, abuf->data, 0);
         /* The backing data has been released. Do not release it again when
            the detached ArrayBuffer object is later finalized. */
         abuf->realloc_func = NULL;
@@ -61055,6 +61500,15 @@ int JS_DetachArrayBuffer(JSContext *ctx, JSValueConst obj)
             p->u.array.count = 0;
             p->u.array.u.ptr = NULL;
         }
+    }
+    return 0;
+}
+
+int JS_DetachArrayBuffer(JSContext *ctx, JSValueConst obj)
+{
+    if (JS_DetachArrayBufferRT(ctx->rt, obj) < 0) {
+        JS_ThrowTypeErrorPinnedArrayBuffer(ctx);
+        return -1;
     }
     return 0;
 }

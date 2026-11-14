@@ -1258,6 +1258,8 @@ JS_EXTERN int JS_IsPinnedArrayBuffer(JSValueConst obj);
 JS_EXTERN int JS_SetArrayBufferPinUnsupported(JSValueConst obj, bool unsupported);
 /* Returns -1 and throws a TypeError when a pin prevents detachment. */
 JS_EXTERN int JS_DetachArrayBuffer(JSContext *ctx, JSValueConst obj);
+/* Runtime-only variant for native finalizers. It never throws. */
+JS_EXTERN int JS_DetachArrayBufferRT(JSRuntime *rt, JSValueConst obj);
 JS_EXTERN uint8_t *JS_GetArrayBuffer(JSContext *ctx, size_t *psize, JSValueConst obj);
 JS_EXTERN bool JS_IsArrayBuffer(JSValueConst obj);
 // returns true or false if obj is an ArrayBuffer, -1 otherwise
@@ -1687,12 +1689,15 @@ typedef int JSModuleInitFunc(JSContext *ctx, JSModuleDef *m);
 
 JS_EXTERN JSModuleDef *JS_NewCModule(JSContext *ctx, const char *name_str,
                                      JSModuleInitFunc *func);
+/* create an already-evaluated C module with a mutable ordinary namespace */
 JS_EXTERN JSModuleDef *JS_NewCModule2(JSContext *ctx, const char *name_str);
 /* can only be called before the module is instantiated */
 JS_EXTERN int JS_AddModuleExport(JSContext *ctx, JSModuleDef *m, const char *name_str);
 JS_EXTERN int JS_AddModuleExportList(JSContext *ctx, JSModuleDef *m,
                                       const JSCFunctionListEntry *tab, int len);
+/* consumes val; the returned token is owned by the module */
 JS_EXTERN void* JS_DefineModuleExport(JSContext *ctx, JSModuleDef *m, JSAtom name, JSValue val);
+/* deprecated compatibility no-op: export tokens are module-owned */
 JS_EXTERN void JS_FreeModuleExport(JSRuntime* rt, void* module_var);
 /* can only be called after the module is instantiated */
 JS_EXTERN int JS_SetModuleExport(JSContext *ctx, JSModuleDef *m, const char *export_name,
