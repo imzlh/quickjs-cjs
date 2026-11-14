@@ -1244,7 +1244,20 @@ JS_EXTERN JSValue JS_NewArrayBuffer(JSContext *ctx, uint8_t *buf, size_t len,
                                     JSReallocArrayBufferDataFunc *realloc_func,
                                     void *opaque, bool is_shared);
 JS_EXTERN JSValue JS_NewArrayBufferCopy(JSContext *ctx, const uint8_t *buf, size_t len);
-JS_EXTERN void JS_DetachArrayBuffer(JSContext *ctx, JSValueConst obj);
+/* Pins prevent an ArrayBuffer's backing address from changing without making
+   its contents immutable. A pin does not retain |obj|: every caller must keep
+   the ArrayBuffer or SharedArrayBuffer alive until the matching unpin.
+   JS_PinArrayBuffer() returns -1 and throws on invalid, detached, overflowing,
+   or explicitly unsupported buffers. The other functions return -1 for an
+   invalid object or unmatched unpin without throwing. */
+JS_EXTERN int JS_PinArrayBuffer(JSContext *ctx, JSValueConst obj);
+JS_EXTERN int JS_UnpinArrayBuffer(JSValueConst obj);
+/* Returns true or false for an ArrayBuffer or SharedArrayBuffer, -1 otherwise. */
+JS_EXTERN int JS_IsPinnedArrayBuffer(JSValueConst obj);
+/* Marks externally managed backing stores that cannot safely be pinned. */
+JS_EXTERN int JS_SetArrayBufferPinUnsupported(JSValueConst obj, bool unsupported);
+/* Returns -1 and throws a TypeError when a pin prevents detachment. */
+JS_EXTERN int JS_DetachArrayBuffer(JSContext *ctx, JSValueConst obj);
 JS_EXTERN uint8_t *JS_GetArrayBuffer(JSContext *ctx, size_t *psize, JSValueConst obj);
 JS_EXTERN bool JS_IsArrayBuffer(JSValueConst obj);
 // returns true or false if obj is an ArrayBuffer, -1 otherwise

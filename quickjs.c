@@ -972,8 +972,10 @@ typedef struct JSProxyData {
 typedef struct JSArrayBuffer {
     int byte_length; /* 0 if detached */
     int max_byte_length; /* -1 if not resizable; >= byte_length otherwise */
+    uint32_t pin_count; /* backing address cannot change while non-zero */
     uint8_t detached;
     uint8_t immutable;
+    uint8_t pin_unsupported;
     uint8_t shared; /* if shared, the array buffer cannot be detached */
     uint8_t *data; /* NULL if detached */
     struct list_head array_list;
@@ -40490,6 +40492,10 @@ static int JS_PrepareAutoTransfers(JSContext *ctx, JSAutoTransferTab *tab)
             return -1;
         }
         abuf = JS_GetOpaque(tab->tab[i].value, JS_CLASS_ARRAY_BUFFER);
+        if (abuf && abuf->pin_count != 0) {
+            JS_ThrowTypeError(ctx, "ArrayBuffer is pinned");
+            return -1;
+        }
         if (!abuf || abuf->detached || abuf->max_byte_length >= 0 ||
             !abuf->data || !abuf->opaque ||
             abuf->realloc_func != js_auto_backing_realloc) {
@@ -40557,6 +40563,10 @@ int JS_CommitArrayBufferTransfers(JSContext *ctx, JSAutoTransferTab *tab)
             return -1;
         }
         abuf = JS_GetOpaque(entry->value, JS_CLASS_ARRAY_BUFFER);
+        if (abuf && abuf->pin_count != 0) {
+            JS_ThrowTypeError(ctx, "ArrayBuffer is pinned");
+            return -1;
+        }
         if (!abuf || abuf->detached || abuf->data != entry->data ||
             abuf->byte_length != entry->byte_length ||
             abuf->opaque != entry->opaque ||
@@ -40568,7 +40578,8 @@ int JS_CommitArrayBufferTransfers(JSContext *ctx, JSAutoTransferTab *tab)
     for (i = 0; i < tab->len; i++) {
         /* Prepare retained the wire reference. Detaching releases only the
            source reference, leaving the backing alive for the receiver. */
-        JS_DetachArrayBuffer(ctx, tab->tab[i].value);
+        if (JS_DetachArrayBuffer(ctx, tab->tab[i].value))
+            return -1;
     }
     tab->state = JS_AUTO_TRANSFER_COMMITTED;
     return 0;
@@ -60611,8 +60622,10 @@ static JSValue js_array_buffer_constructor3(JSContext *ctx,
         }
     }
     init_list_head(&abuf->array_list);
+    abuf->pin_count = 0;
     abuf->detached = false;
     abuf->immutable = false;
+    abuf->pin_unsupported = false;
     abuf->shared = (class_id == JS_CLASS_SHARED_ARRAY_BUFFER);
     abuf->opaque = opaque;
     abuf->realloc_func = realloc_func;
@@ -60800,6 +60813,11 @@ static JSValue JS_ThrowTypeErrorImmutableArrayBuffer(JSContext *ctx)
     return JS_ThrowTypeError(ctx, "ArrayBuffer is immutable");
 }
 
+static JSValue JS_ThrowTypeErrorPinnedArrayBuffer(JSContext *ctx)
+{
+    return JS_ThrowTypeError(ctx, "ArrayBuffer is pinned");
+}
+
 static JSValue JS_ThrowTypeErrorArrayBufferOOB(JSContext *ctx)
 {
     return JS_ThrowTypeError(ctx, "ArrayBuffer is detached or resized");
@@ -60859,13 +60877,79 @@ static JSValue js_array_buffer_get_resizable(JSContext *ctx,
     return js_bool(array_buffer_is_resizable(abuf));
 }
 
-void JS_DetachArrayBuffer(JSContext *ctx, JSValueConst obj)
+static JSArrayBuffer *js_get_array_buffer_no_throw(JSValueConst obj)
+{
+    JSArrayBuffer *abuf = JS_GetOpaque(obj, JS_CLASS_ARRAY_BUFFER);
+
+    if (!abuf)
+        abuf = JS_GetOpaque(obj, JS_CLASS_SHARED_ARRAY_BUFFER);
+    return abuf;
+}
+
+int JS_PinArrayBuffer(JSContext *ctx, JSValueConst obj)
+{
+    JSArrayBuffer *abuf = js_get_array_buffer_no_throw(obj);
+
+    if (!abuf) {
+        JS_ThrowTypeError(ctx, "not an ArrayBuffer or SharedArrayBuffer");
+        return -1;
+    }
+    if (abuf->detached) {
+        JS_ThrowTypeErrorDetachedArrayBuffer(ctx);
+        return -1;
+    }
+    if (abuf->pin_unsupported) {
+        JS_ThrowTypeError(ctx, "ArrayBuffer backing store does not support pinning");
+        return -1;
+    }
+    if (abuf->pin_count == UINT32_MAX) {
+        JS_ThrowTypeError(ctx, "ArrayBuffer pin count overflow");
+        return -1;
+    }
+    abuf->pin_count++;
+    return 0;
+}
+
+int JS_UnpinArrayBuffer(JSValueConst obj)
+{
+    JSArrayBuffer *abuf = js_get_array_buffer_no_throw(obj);
+
+    if (!abuf || abuf->pin_count == 0)
+        return -1;
+    abuf->pin_count--;
+    return 0;
+}
+
+int JS_IsPinnedArrayBuffer(JSValueConst obj)
+{
+    JSArrayBuffer *abuf = js_get_array_buffer_no_throw(obj);
+
+    if (!abuf)
+        return -1;
+    return abuf->pin_count != 0;
+}
+
+int JS_SetArrayBufferPinUnsupported(JSValueConst obj, bool unsupported)
+{
+    JSArrayBuffer *abuf = js_get_array_buffer_no_throw(obj);
+
+    if (!abuf || (unsupported && abuf->pin_count != 0))
+        return -1;
+    abuf->pin_unsupported = unsupported;
+    return 0;
+}
+
+int JS_DetachArrayBuffer(JSContext *ctx, JSValueConst obj)
 {
     JSArrayBuffer *abuf = JS_GetOpaque(obj, JS_CLASS_ARRAY_BUFFER);
     struct list_head *el;
 
     if (!abuf || abuf->detached)
-        return;
+        return 0;
+    if (abuf->pin_count != 0) {
+        JS_ThrowTypeErrorPinnedArrayBuffer(ctx);
+        return -1;
+    }
     if (abuf->realloc_func) {
         abuf->realloc_func(ctx->rt, abuf->opaque, abuf->data, 0);
         /* The backing data has been released. Do not release it again when
@@ -60889,6 +60973,7 @@ void JS_DetachArrayBuffer(JSContext *ctx, JSValueConst obj)
             p->u.array.u.ptr = NULL;
         }
     }
+    return 0;
 }
 
 int JS_IsImmutableArrayBuffer(JSValueConst obj)
@@ -61015,6 +61100,8 @@ static JSValue js_array_buffer_transfer(JSContext *ctx, JSValueConst this_val,
         return JS_EXCEPTION;
     if (abuf->immutable)
         return JS_ThrowTypeErrorImmutableArrayBuffer(ctx);
+    if (abuf->pin_count != 0)
+        return JS_ThrowTypeErrorPinnedArrayBuffer(ctx);
     if (abuf->detached)
         return JS_ThrowTypeErrorDetachedArrayBuffer(ctx);
     pmax_len = NULL;
@@ -61028,7 +61115,8 @@ static JSValue js_array_buffer_transfer(JSContext *ctx, JSValueConst this_val,
     }
     /* create an empty AB */
     if (new_len == 0) {
-        JS_DetachArrayBuffer(ctx, this_val);
+        if (JS_DetachArrayBuffer(ctx, this_val))
+            return JS_EXCEPTION;
         ret = js_array_buffer_constructor2(ctx, JS_UNDEFINED, 0, pmax_len,
                                            JS_CLASS_ARRAY_BUFFER);
         goto fini;
@@ -61089,6 +61177,8 @@ static JSValue js_array_buffer_resize(JSContext *ctx, JSValueConst this_val,
         return JS_ThrowTypeErrorImmutableArrayBuffer(ctx);
     if (JS_ToInt64(ctx, &len, argv[0]))
         return JS_EXCEPTION;
+    if (abuf->pin_count != 0)
+        return JS_ThrowTypeErrorPinnedArrayBuffer(ctx);
     if (abuf->detached)
         return JS_ThrowTypeErrorDetachedArrayBuffer(ctx);
     if (!array_buffer_is_resizable(abuf))

@@ -526,7 +526,8 @@ static JSValue js_print_262(JSContext *ctx, JSValueConst this_val,
 static JSValue js_detachArrayBuffer(JSContext *ctx, JSValueConst this_val,
                                     int argc, JSValueConst *argv)
 {
-    JS_DetachArrayBuffer(ctx, argv[0]);
+    if (JS_DetachArrayBuffer(ctx, argv[0]) < 0)
+        return JS_EXCEPTION;
     return JS_UNDEFINED;
 }
 

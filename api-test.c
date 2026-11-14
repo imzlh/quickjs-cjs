@@ -1706,7 +1706,7 @@ static void detach_array_buffer_free_once(void)
     assert(JS_IsArrayBuffer(obj));
 
     /* detaching releases the backing store exactly once */
-    JS_DetachArrayBuffer(ctx, obj);
+    assert(JS_DetachArrayBuffer(ctx, obj) == 0);
     assert(detach_free_count == 1);
 
     /* finalizing the detached buffer must not release it a second time */
