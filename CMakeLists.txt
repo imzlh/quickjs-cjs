@@ -302,6 +302,37 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "WASI")
     list(APPEND qjs_libs ${CMAKE_THREAD_LIBS_INIT})
 endif()
 
+# QuickJS implements Atomics.* through 64-bit __atomic intrinsics. Targets
+# without native 64-bit atomic instructions (MIPS32, ARMv5, ...) emit calls
+# into libatomic, so link it when the inline builtin is unavailable. Keep the
+# fallback silent for toolchains that have neither (MSVC and friends): their
+# atomic code paths do not reference the GCC builtins at all.
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    include(CheckCSourceCompiles)
+    set(QJS_ATOMIC_PROBE "\
+#include <stdint.h>
+int main(void) {
+    _Atomic uint64_t value = 0;
+    __atomic_fetch_add(&value, 1, __ATOMIC_SEQ_CST);
+    return (int)value;
+}")
+    set(CMAKE_REQUIRED_QUIET_SAVE "${CMAKE_REQUIRED_QUIET}")
+    set(CMAKE_REQUIRED_QUIET ON)
+    check_c_source_compiles("${QJS_ATOMIC_PROBE}" QJS_HAVE_INLINE_64BIT_ATOMICS)
+    if(NOT QJS_HAVE_INLINE_64BIT_ATOMICS)
+        set(CMAKE_REQUIRED_LIBRARIES atomic)
+        check_c_source_compiles("${QJS_ATOMIC_PROBE}" QJS_HAVE_LIBATOMIC_64BIT_ATOMICS)
+        unset(CMAKE_REQUIRED_LIBRARIES)
+        if(QJS_HAVE_LIBATOMIC_64BIT_ATOMICS)
+            list(APPEND qjs_libs atomic)
+        else()
+            message(STATUS "64-bit atomics are neither inline nor provided by libatomic; Atomics.* targets may fail to link")
+        endif()
+    endif()
+    set(CMAKE_REQUIRED_QUIET "${CMAKE_REQUIRED_QUIET_SAVE}")
+    unset(CMAKE_REQUIRED_QUIET_SAVE)
+endif()
+
 add_library(qjs ${qjs_sources})
 target_compile_definitions(qjs PRIVATE ${qjs_defines})
 target_include_directories(qjs PUBLIC
